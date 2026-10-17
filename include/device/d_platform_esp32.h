@@ -124,6 +124,7 @@ static inline void platform_log_level_set(const platform_log_level_t level) {
 static inline platform_reset_t platform_reset_reason(void) {
     switch (esp_reset_reason()) {
     case ESP_RST_POWERON:
+    case ESP_RST_USB: // development "power on"
         return PLATFORM_RESET_POWER_ON;
     case ESP_RST_SW:
         return PLATFORM_RESET_SOFTWARE;

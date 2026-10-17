@@ -34,6 +34,13 @@
 #define BATTERY_SELFTEST_MS 0
 #endif
 
+#ifndef STARTUP_REPORT_GAP_MS
+#define STARTUP_REPORT_GAP_MS 300
+#endif
+#ifndef STARTUP_REPORT_TRIES
+#define STARTUP_REPORT_TRIES 3
+#endif
+
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // HARDWARE
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -45,9 +52,6 @@
 #include "d_console_esp32.h"
 #include "d_module_datastore_esp32.h"
 #include "d_module_filestore_esp32.h"
-/* the OTA seams: iotdata_node_otaupdate.h assembles these, and every node that uses the
-   framework has an update path, so every node includes them. None depends on an iotdata
-   header, so they sit here in the d_ block with the rest. */
 #include "d_module_otaslot_esp32.h"
 #include "d_module_inflate_esp32.h"
 #include "d_module_hpatch.h"
@@ -193,6 +197,8 @@ typedef struct {
     int16_t battery_mv;   /* last reading, for the charging trend bit        */
     bool battery_present; /* a divider answered the probe at restart         */
     bool lora_present;    /* E22 NVM configuration verified this power cycle */
+    uint16_t startup_owed; /* bit N = system TLV N still to report since the cold boot */
+    uint8_t startup_tries; /* cycles spent trying to send them                       */
     app_operating_t app;
 } iapp_operating_t;
 
@@ -477,10 +483,12 @@ static bool iapp_init(iapp_state_t *const as) {
     if (!iotdata_node_version_stamp_is_real())
         ESP_LOGW(__tag_iapp, "version: build stamp is unset -- this binary cannot say when it was built");
 
+    // protocol settings start from defaults with or without a store to load over them
+    iotdata_node_settings_defaults(&as->running->node_settings, iotdata_node_station(&as->operating->node));
+
     // open the datastore and hydrate storage
     if (datastore_open(&as->running->datastore, "iotdata")) {
         iotdata_node_state_init(&as->running->node, &as->running->datastore, "state");
-        iotdata_node_settings_defaults(&as->running->node_settings, iotdata_node_station(&as->operating->node));
         if (!iotdata_node_settings_attach(&as->running->node_settings, &as->running->node))
             ESP_LOGW(__tag_iapp, "state: persistence not available, protocol settings will not persist");
         if (!iotdata_node_bind(&as->operating->node, &as->running->node, IAPP_STATE_TAG))
@@ -499,6 +507,14 @@ static bool iapp_init(iapp_state_t *const as) {
         }
     } else
         ESP_LOGW(__tag_iapp, "state: persistence disabled (no datastore)");
+
+    if (cold_boot) {
+        for (uint8_t t = 0; t < IOTDATA_NODE_TLV_SYSTEM_COUNT; t++)
+            if (iotdata_node_tlv_is_reportable(t) && iotdata_node_settings_at_startup(&as->running->node_settings, t))
+                as->operating->startup_owed |= (uint16_t)(1u << t);
+        as->operating->startup_tries = 0;
+        ESP_LOGI(__tag_iapp, "startup: reports owed 0x%04" PRIX16 " (%s boot)", as->operating->startup_owed, reset_reason == ESP_RST_USB ? "usb" : "cold");
+    }
 
     // record power state
     if (cold_boot)
@@ -571,6 +587,28 @@ static bool iapp_sleep(iapp_state_t *const as, const uint32_t start_ms, bool dee
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
+static void iapp_startup_reports(iapp_state_t *const as, const bool lora_started) {
+    iapp_operating_t *const o = as->operating;
+    if (o->startup_owed) {
+        if (lora_started)
+            for (uint8_t t = 0; t < IOTDATA_NODE_TLV_SYSTEM_COUNT && o->startup_owed != 0u; t++)
+                if ((o->startup_owed & (uint16_t)(1u << t)) != 0u) {
+                    hw_delay_ms_yieldable(STARTUP_REPORT_GAP_MS);
+                    if (iotdata_node_report(&o->node, t)) {
+                        o->startup_owed &= (uint16_t)~(1u << t);
+                        ESP_LOGI(__tag_iapp, "startup: reported %s", iotdata_node_tlv_name(t));
+                    } else
+                        ESP_LOGW(__tag_iapp, "startup: report %s failed, will retry", iotdata_node_tlv_name(t));
+	        }
+        if (o->startup_owed != 0u && ++o->startup_tries >= STARTUP_REPORT_TRIES) {
+            ESP_LOGW(__tag_iapp, "startup: giving up on reports 0x%04" PRIX16 " after %u cycle(s)", o->startup_owed, (unsigned)o->startup_tries);
+            o->startup_owed = 0u;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
 static bool iapp_exec(iapp_state_t *const as) {
 
     const app_descr_t *const ad = app_spec;
@@ -600,7 +638,8 @@ static bool iapp_exec(iapp_state_t *const as) {
             return false;
         as->operating->tx_cycles++;
 
-        if (transmit || receive) {
+        const bool announce = as->operating->startup_owed != 0u;
+        if (transmit || receive || announce) {
             if (!as->operating->lora_present) {
                 lora_config_t lora_cfg;
                 iotdata_node_config_lora_apply(&lora_cfg);
@@ -621,6 +660,8 @@ static bool iapp_exec(iapp_state_t *const as) {
                     iotdata_node_diagnostics_event(IOTDATA_NODE_BB_LC_ERROR, iotdata_node_diagnostics_reason(as->operating->tx_errors));
                 }
             }
+            if (announce)
+                iapp_startup_reports(as, lora_started); /* after the data packet, before listening */
             if (lora_started && receive)
                 iapp_node_receive(as);
             if (lora_started)
