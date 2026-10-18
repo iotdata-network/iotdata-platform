@@ -29,8 +29,10 @@ const A = process.argv.slice(2),
     };
 if (A.includes('--help') || A.includes('-h')) {
     console.log(`usage: lm-terrain-ground [options]
-  --state PATH[,PATH]  topology state file(s) to read positions from (default ./topology.json)
-  --cache DIR          cache directory                               (default ./cache)
+  --deployment D       the deployment: a path, or a name under iotdata-deploy (or IOTDATA_DEPLOYMENT;
+                       default the current directory)
+  --state PATH[,PATH]  topology state file(s) to read positions from (default <deployment>/topology.json)
+  --cache DIR          cache directory                               (default <deployment>/cache)
   --radius M           cache this far around every point             (default 1000)
   --force              refetch blocks that are already cached
   --dry-run            list what would be fetched, then stop
@@ -39,10 +41,11 @@ Set LM_USERPASS="user:pass" with your Lantmateriet Geotorget credentials.
 Point several sites at one --cache to share blocks: they are keyed by national grid kilometre.`);
     process.exit(0);
 }
-const STATES = opt('state', './topology.json')
+const DEPLOY = require('./lib/deploy').deploymentDir(opt('deployment', process.env.IOTDATA_DEPLOYMENT || ''));
+const STATES = opt('state', path.join(DEPLOY, 'topology.json'))
     .split(',')
     .map((s) => path.resolve(s.trim()));
-const CACHE = path.resolve(opt('cache', './cache'));
+const CACHE = path.resolve(opt('cache', path.join(DEPLOY, 'cache')));
 const RADIUS = Number(opt('radius', 1000));
 const FORCE = A.includes('--force'),
     DRY = A.includes('--dry-run');

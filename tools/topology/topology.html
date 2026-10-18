@@ -180,6 +180,12 @@
       <div id="sensors"></div><button class="add" id="addsensor">+ add sensor</button>
       <div class="hint">Sensors carry no rings &mdash; hover one to see its reach to each gateway and relay.</div>
     </div></details>
+    <details open><summary>walk survey</summary><div class="body">
+      <div class="hint" id="svinfo">waiting for the server</div>
+      <div class="row" style="margin-top:6px"><button id="svfit">show walk</button><button id="svclear">new walk</button></div>
+      <div class="hint">Each press of the survey button lands here as a point, joined in walk order.
+        Hover or click one for what it heard there, strongest first.</div>
+    </div></details>
     <div class="row">
       <button class="p" id="save">save</button><button id="reload">reload</button><button id="print">print</button>
     </div>
@@ -214,6 +220,9 @@ let map, S = null, elev = null, marks = { nodes: [], sensors: [] }, rings = [], 
    now, which differs from `pin` while another marker is hovered over the top of it. `sel` is the
    link whose profile is open. */
 let pin = null, shown = null, sel = null, dragging = false;
+/* the walk survey: reports from the server, and their markers */
+let SV = { reports: [], stations: {}, mqtt: null }, svMarks = [], svTrail = null;
+const SURVEYC = '#b48cff';
 const $ = (id) => document.getElementById(id);
 const colourOf = (kind, i) => kind === 'nodes' ? COLOURS[i % COLOURS.length] : SENSOR;
 const msg = (t) => { $('msg').textContent = t;
@@ -248,6 +257,7 @@ async function boot() {
     mapTypeControl: false, streetViewControl: false, tilt: 0,
   });
   elev = new google.maps.ElevationService();
+  google.maps.event.addListenerOnce(map, 'idle', surveyBoot);
   /* A marker click does not reach the map, so this only fires on bare map. While a panel is
      pinned that is the gesture for dropping a probe; with nothing pinned it just dismisses. */
   map.addListener('mousemove', (ev) => eleCursor(ev.latLng));
@@ -588,6 +598,8 @@ function linkInfo(me, n) {
    sensor would bury the one comparison that matters. A sensor is shown its reach to each gateway
    and relay, which is the question being asked when you place one. */
 function hover(kind, i) {
+  if (kind === 'survey') return surveyHover(i);
+  $('hfield').style.display = '';
   const me = subject({ kind, i });
   if (!me) return unpin();
   shown = { kind, i };
@@ -685,6 +697,127 @@ function hover(kind, i) {
   $('hover').style.display = 'block';
 }
 
+/* ------------------------------------------------------------------ the walk survey ---------- */
+
+/* Where a station is on this map. A layout entry can name its station outright (`station`, hex);
+   otherwise the station's monitor name is matched against layout names by their WORDS, in any
+   order -- "bastu-relay" is the layout's "relay-bastu". */
+const words = (n) => String(n || '').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).sort().join(' ');
+function stationAt(id) {
+  const all = [...S.nodes, ...S.sensors];
+  const want = String(id).toUpperCase();
+  const byId = all.find((e) => e.station && String(e.station).toUpperCase().padStart(3, '0') === want);
+  if (byId) return byId;
+  const nm = SV.stations[want];
+  if (!nm) return null;
+  const exact = all.find((e) => words(e.name) === words(nm));
+  if (exact) return exact;
+  /* failing that, the longest layout name it starts with: "storage-room-sim-1" sits at "storage-room" */
+  const lc = String(nm).toLowerCase();
+  return all.filter((e) => e.name && lc.startsWith(String(e.name).toLowerCase() + '-'))
+            .sort((a, b) => b.name.length - a.name.length)[0] || null;
+}
+const rssiCls = (r) => r == null ? '' : r >= -95 ? 'ok' : r >= -110 ? 'warn' : 'bad';
+
+async function surveyBoot() {
+  try {
+    const o = await (await fetch('/api/survey')).json();
+    SV.reports = o.reports || []; SV.stations = o.stations || {}; SV.mqtt = o.mqtt || null;
+  } catch { /* an older server: no walk, and nothing else changes */ }
+  drawSurvey();
+  const es = new EventSource('/api/survey/events');
+  es.addEventListener('mqtt', (ev) => { SV.mqtt = JSON.parse(ev.data); surveyInfo(); });
+  es.addEventListener('report', (ev) => {
+    const r = JSON.parse(ev.data), k = SV.reports.findIndex((x) => x.key === r.key);
+    if (k >= 0) SV.reports[k] = r; else SV.reports.push(r);
+    drawSurvey();
+    if (shown && shown.kind === 'survey') surveyHover(shown.i);
+  });
+  es.addEventListener('clear', () => {
+    SV.reports = [];
+    if (shown && shown.kind === 'survey') unpin();
+    drawSurvey();
+  });
+  $('svfit').onclick = () => {
+    const pts = SV.reports.filter((r) => r.lat != null);
+    if (!pts.length) return msg('no survey points yet');
+    const b = new google.maps.LatLngBounds();
+    for (const r of pts) b.extend({ lat: r.lat, lng: r.lng });
+    map.fitBounds(b, 80);
+  };
+  $('svclear').onclick = async () => {
+    if (!SV.reports.length || !confirm(`Start a new walk? The ${SV.reports.length} point(s) so far are archived, not lost.`)) return;
+    await fetch('/api/survey', { method: 'DELETE' });
+  };
+}
+
+function surveyInfo() {
+  const n = SV.reports.filter((r) => r.lat != null).length;
+  const m = SV.mqtt;
+  $('svinfo').textContent = (m ? `mqtt ${m.host}: ${m.up ? 'live' : 'not connected'}` : 'no live feed')
+    + ` · ${n} point${n === 1 ? '' : 's'}`;
+}
+
+/* One marker per report, numbered in walk order and coloured by the best signal heard there; the
+   trail joins them so the route reads at a glance. Redrawn wholesale -- a walk is a few hundred
+   points at most. */
+function drawSurvey() {
+  for (const m of svMarks) m.setMap(null);
+  svMarks = [];
+  const path = [];
+  SV.reports.forEach((r, i) => {
+    if (r.lat == null || r.lng == null) return;
+    const best = Math.max(...Object.values(r.heard).map((h) => h.rssi ?? -999));
+    const fill = { ok: '#5fd37a', warn: '#f0b429', bad: '#ff6b86', '': '#888' }[rssiCls(best > -999 ? best : null)];
+    const p = { lat: r.lat, lng: r.lng };
+    path.push(p);
+    const m = new google.maps.Marker({ position: p, map, zIndex: 50, title: 'survey #' + (i + 1),
+      icon: { path: google.maps.SymbolPath.CIRCLE, scale: 7, fillColor: fill, fillOpacity: 1,
+              strokeColor: SURVEYC, strokeWeight: 2.5 },
+      label: { text: String(i + 1), color: '#111', fontSize: '9px', fontWeight: '700' } });
+    m.addListener('mouseover', () => { if (!pin) hover('survey', i); });
+    m.addListener('mouseout', () => hideHover());
+    m.addListener('click', () => clickMark('survey', i));
+    svMarks.push(m);
+  });
+  if (path.length > 1) {
+    if (svTrail) svTrail.setPath(path);
+    else svTrail = new google.maps.Polyline({ path, map, zIndex: 45, clickable: false, geodesic: true,
+                                              strokeColor: SURVEYC, strokeOpacity: 0.8, strokeWeight: 2 });
+  } else if (svTrail) { svTrail.setMap(null); svTrail = null; }
+  surveyInfo();
+}
+
+/* The same panel as a node's, with the question turned round: not "what could this reach" but
+   "what did it actually hear here" -- each station, strongest first, with how far away it is. */
+function surveyHover(i) {
+  const r = SV.reports[i];
+  if (!r) return unpin();
+  shown = { kind: 'survey', i };
+  const live = !!pin && pin.kind === 'survey' && pin.i === i;
+  $('hover').classList.toggle('pinned', live);
+  $('hfield').style.display = 'none';            /* a receptivity field means nothing for a stand */
+  $('hdot').style.background = SURVEYC;
+  $('hname').textContent = `survey #${i + 1}  ${r.observer}  ${r.at ? new Date(r.at).toLocaleTimeString() : ''}`;
+  const sph = google.maps.geometry.spherical, a = new google.maps.LatLng(r.lat, r.lng);
+  const rows = Object.entries(r.heard).map(([id, h]) => {
+    const at = stationAt(id), b = at ? new google.maps.LatLng(at.lat, at.lng) : null;
+    return { id, name: at ? at.name : (SV.stations[id] || ''), rssi: h.rssi,
+             d: b ? sph.computeDistanceBetween(a, b) : null, brg: b ? (sph.computeHeading(a, b) + 360) % 360 : null };
+  }).sort((x, y) => (y.rssi ?? -999) - (x.rssi ?? -999));
+  let h = '<table><tr><th>heard</th><th>dist</th><th>brg</th><th>rssi</th></tr>';
+  for (const x of rows)
+    h += `<tr><td>${esc(x.id)} ${esc(x.name)}</td><td>${x.d != null ? m2s(x.d) : '&mdash;'}</td>`
+       + `<td>${x.brg != null ? x.brg.toFixed(0) + '&deg;' : '&mdash;'}</td>`
+       + `<td class="${rssiCls(x.rssi)}">${x.rssi != null ? x.rssi + ' dBm' : '&mdash;'}</td></tr>`;
+  h += '</table><div class="probeline"><span>' + r.lat.toFixed(6) + ', ' + r.lng.toFixed(6) + '</span><span>'
+     + (r.alt != null ? r.alt + 'm · ' : '') + rows.length + ' heard</span></div>';
+  if (rows.some((x) => x.d == null))
+    h += '<div class="hint">No distance: that station is not placed on this map, or its name does not match one here (give the layout entry a <code>station</code> id).</div>';
+  $('hbody').innerHTML = h;
+  $('hover').style.display = 'block';
+}
+
 /* ------------------------------------------------------------------ the probe ----------------- */
 
 /* A throwaway point, placed by clicking the map while a panel is pinned. It behaves exactly like a
@@ -698,7 +831,9 @@ let probe = null, probeMark = null;
    only as a destination -- same table, same profiles, same receptivity field, but for a position
    that does not exist yet. */
 const subject = (p) => !p ? null
-  : p.kind === 'probe' ? probe : (S[p.kind] && S[p.kind][p.i]);
+  : p.kind === 'probe' ? probe
+  : p.kind === 'survey' ? (SV.reports[p.i] ? { ...SV.reports[p.i], name: 'survey #' + (p.i + 1) } : null)
+  : (S[p.kind] && S[p.kind][p.i]);
 const labelOf = (p) => !p ? '' : p.kind === 'probe' ? 'probe site'
   : (p.kind === 'nodes' ? '' : 'S' + (p.i + 1) + ' ') + (subject(p) || {}).name;
 

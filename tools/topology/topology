@@ -32,24 +32,39 @@ const A = process.argv.slice(2),
     };
 if (A.includes('--help') || A.includes('-h')) {
     console.log(`usage: topology [options]
+  --deployment D  the deployment: a path, or a name under iotdata-deploy (se-67194); its
+                  topology/ holds topology.json, survey.json and cache/
+                  (or set IOTDATA_DEPLOYMENT; default the current directory)
   --port N        listen port                      (default 4096)
   --host H        bind address                     (default 0.0.0.0, reachable from the LAN)
-  --persist PATH  where positions are saved        (default ./topology.json)
+  --persist PATH  where positions are saved        (default <deployment>/topology.json)
   --spacing M     default ring spacing in metres   (default 100)
   --max M         default outermost ring in metres (default 1000)
-  --cache DIR     terrain cache directory          (default ./cache)
+  --cache DIR     terrain cache directory          (default <deployment>/cache)
   --cache-mem MB  ceiling for decompressed blocks   (default 192)
-  --key K         Maps JS API key                  (or set MAPS_API_KEY)`);
+  --key K         Maps JS API key                  (or set MAPS_API_KEY)
+  --mqtt HOST     broker for live survey reports   (default localhost; none to switch off)
+  --mqtt-topic T  where survey reports arrive      (default iotdata/manage/from/#)
+  --survey PATH   where survey reports are kept    (default <deployment>/survey.json)
+  --stations PATH station id -> name, from a gateway monitor config
+                                                   (default /etc/default/iotdata-gateway-monitor)`);
     process.exit(0);
 }
+/* One copy of the tool, many sites: the deployment's directory holds its layout, its walk and its
+   terrain, and the program -- with its page and lib -- stays where it is installed. */
+const DEPLOY = require('./lib/deploy').deploymentDir(opt('deployment', process.env.IOTDATA_DEPLOYMENT || ''));
 const PORT = Number(opt('port', 4096)),
     HOST = opt('host', '0.0.0.0');
-const PERSIST = path.resolve(opt('persist', './topology.json'));
+const PERSIST = path.resolve(opt('persist', path.join(DEPLOY, 'topology.json')));
 const SPACING = Number(opt('spacing', 100)),
     MAXR = Number(opt('max', 1000));
-const CACHEDIR = path.resolve(opt('cache', './cache'));
+const CACHEDIR = path.resolve(opt('cache', path.join(DEPLOY, 'cache')));
 const CACHEMEM = Math.max(8, Number(opt('cache-mem', 192))) * 1e6;
 const KEY = opt('key', process.env.MAPS_API_KEY || '');
+const MQTT = opt('mqtt', 'localhost'),
+    MQTT_TOPIC = opt('mqtt-topic', 'iotdata/manage/from/#');
+const SURVEY = path.resolve(opt('survey', path.join(DEPLOY, 'survey.json')));
+const STATIONS = opt('stations', '/etc/default/iotdata-gateway-monitor');
 if (!KEY) {
     console.error('topology: no Maps key. Pass --key or set MAPS_API_KEY.');
     process.exit(2);
@@ -429,6 +444,129 @@ function terrainInfo() {
     };
 }
 
+/* ------------------------------------------------------------------ walk survey --------------- */
+/* Live reports from a survey instrument, taken off the broker as the gateways publish them: one
+ * message per station it heard, carrying where it was standing. Grouped back into the report they
+ * came from -- same instrument, same timestamp, same position -- so the page can plot one point per
+ * press of the button, and say what was heard there.
+ *
+ * Every gateway that hears a report publishes it, so each observation can arrive once per path; its
+ * (observer, station, seq) is its identity, and only the first copy counts.
+ *
+ * Kept in its own file, not in the layout: the layout is what gets edited and committed, a walk is
+ * a session's data. Clearing a walk archives it beside the file rather than discarding it.
+ */
+const hexId = (n) => Number(n).toString(16).toUpperCase().padStart(3, '0');
+const stationNames = (() => {
+    const out = {};
+    try {
+        for (const line of fs.readFileSync(STATIONS, 'utf8').split('\n')) {
+            const m = /^\s*station-([0-9A-Fa-f]{1,8})-name\s*=\s*(.+?)\s*$/.exec(line);
+            if (m) out[m[1].toUpperCase().padStart(3, '0')] = m[2].replace(/\[.*$/, '');
+        }
+    } catch {
+        /* no monitor config here: stations are shown by id, and matched by an explicit `station` */
+    }
+    return out;
+})();
+let survey = { reports: [] };
+try {
+    const s = JSON.parse(fs.readFileSync(SURVEY, 'utf8'));
+    if (s && Array.isArray(s.reports)) survey = s;
+} catch (e) {
+    if (e.code !== 'ENOENT') console.error(`topology: ${SURVEY}: ${e.message}, starting a new walk`);
+}
+const seenObs = new Set(survey.reports.flatMap((r) => Object.entries(r.heard).map(([st, h]) => `${r.observer}:${st}:${h.seq}`)));
+let surveyTimer = null;
+const surveySave = () => {
+    clearTimeout(surveyTimer);
+    surveyTimer = setTimeout(() => {
+        const tmp = SURVEY + '.tmp';
+        try {
+            fs.writeFileSync(tmp, JSON.stringify(survey, null, 1) + '\n');
+            fs.renameSync(tmp, SURVEY);
+        } catch (e) {
+            console.error(`topology: ${SURVEY}: ${e.message}`);
+        }
+    }, 2000);
+};
+const surveyClients = new Set();
+const surveyPush = (event, obj) => {
+    const frame = `event: ${event}\ndata: ${JSON.stringify(obj)}\n\n`;
+    for (const c of surveyClients) c.write(frame);
+};
+const mqttState = { host: MQTT, topic: MQTT_TOPIC, up: false };
+function surveyObserve(b) {
+    if (b.type !== 'survey' || b.cmd !== 'survey' || b.observer == null || b.station == null) return;
+    const observer = hexId(b.observer),
+        station = hexId(b.station);
+    const id = `${observer}:${station}:${b.seq}`;
+    if (seenObs.has(id)) return;
+    seenObs.add(id);
+    const key = `${observer}:${b.time}:${b.obs_lat}:${b.obs_lon}`;
+    let r = null;
+    for (let i = survey.reports.length - 1; i >= Math.max(0, survey.reports.length - 8) && !r; i--) if (survey.reports[i].key === key) r = survey.reports[i];
+    if (!r) {
+        r = { key, observer, at: Date.now(), time: b.time ?? null, lat: b.obs_lat ?? null, lng: b.obs_lon ?? null, alt: b.obs_alt ?? null, heard: {} };
+        survey.reports.push(r);
+        if (survey.reports.length > 5000) survey.reports.shift();
+        console.log(`survey: report from ${observer} at ${r.lat != null ? `${r.lat.toFixed(6)}, ${r.lng.toFixed(6)}` : 'no position'}`);
+    }
+    r.heard[station] = { rssi: b.rssi ?? null, seq: b.seq };
+    surveySave();
+    surveyPush('report', r);
+}
+/* mosquitto_sub rather than an MQTT library: this tool has no dependencies and keeps it that way.
+   A broker that is not there is not an error -- the map works exactly as before without one -- so
+   it is said once, and retried quietly. */
+function mqttStart() {
+    if (!MQTT || MQTT === 'none') return;
+    const { spawn } = require('child_process');
+    let said = false;
+    const run = () => {
+        const p = spawn('mosquitto_sub', ['-h', MQTT, '-t', MQTT_TOPIC, '-v', '-k', '30'], { stdio: ['ignore', 'pipe', 'pipe'] });
+        let buf = '',
+            err = '';
+        p.stdout.on('data', (c) => {
+            if (!mqttState.up) {
+                mqttState.up = true;
+                surveyPush('mqtt', mqttState);
+            }
+            buf += c;
+            let nl;
+            while ((nl = buf.indexOf('\n')) >= 0) {
+                const line = buf.slice(0, nl);
+                buf = buf.slice(nl + 1);
+                const sp = line.indexOf(' ');
+                if (sp < 0) continue;
+                try {
+                    surveyObserve(JSON.parse(line.slice(sp + 1)));
+                } catch {
+                    /* not JSON, or not ours */
+                }
+            }
+        });
+        p.stderr.on('data', (c) => (err += c));
+        p.on('error', (e) => (err = e.code === 'ENOENT' ? 'mosquitto_sub is not installed' : e.message));
+        p.on('close', () => {
+            mqttState.up = false;
+            surveyPush('mqtt', mqttState);
+            if (!said) console.log(`topology: no live survey from mqtt://${MQTT} (${(err.trim().split('\n').pop() || 'disconnected')}), retrying quietly`);
+            said = true;
+            setTimeout(run, 10000);
+        });
+        /* mosquitto_sub prints nothing until a message arrives, so a quiet broker is up, not down */
+        setTimeout(() => {
+            if (p.exitCode === null && !mqttState.up) {
+                mqttState.up = true;
+                surveyPush('mqtt', mqttState);
+                if (said) console.log(`topology: live survey from mqtt://${MQTT} ${MQTT_TOPIC}`), (said = false);
+            }
+        }, 3000);
+    };
+    run();
+}
+
 http.createServer((req, res) => {
     const url = new URL(req.url, 'http://x');
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
@@ -550,9 +688,44 @@ http.createServer((req, res) => {
             return;
         }
     }
+    if (url.pathname === '/api/survey') {
+        if (req.method === 'GET') return json(res, 200, { mqtt: mqttState, stations: stationNames, reports: survey.reports });
+        /* a new walk: the old one is archived, never discarded */
+        if (req.method === 'DELETE') {
+            if (survey.reports.length) {
+                const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+                const to = SURVEY.replace(/\.json$/, '') + `-${stamp}.json`;
+                try {
+                    fs.writeFileSync(to, JSON.stringify(survey, null, 1) + '\n');
+                    console.log(`survey: ${survey.reports.length} report(s) archived to ${to}`);
+                } catch (e) {
+                    return json(res, 500, { error: e.message });
+                }
+            }
+            survey = { reports: [] };
+            seenObs.clear();
+            surveySave();
+            surveyPush('clear', {});
+            return json(res, 200, { ok: true });
+        }
+    }
+    if (req.method === 'GET' && url.pathname === '/api/survey/events') {
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive' });
+        res.write(`event: mqtt\ndata: ${JSON.stringify(mqttState)}\n\n`);
+        surveyClients.add(res);
+        const ka = setInterval(() => res.write(': keepalive\n\n'), 20000);
+        req.on('close', () => {
+            clearInterval(ka);
+            surveyClients.delete(res);
+        });
+        return;
+    }
     send(res, 404, 'text/plain', 'not found\n');
 }).listen(PORT, HOST, () => {
+    mqttStart();
+    console.log(`topology: survey reports in ${SURVEY} (${survey.reports.length} so far), ${Object.keys(stationNames).length} station name(s) from ${STATIONS}`);
     console.log(`topology: http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}  (${SPACING}m rings to ${MAXR}m)`);
+    console.log(`topology: deployment ${DEPLOY}`);
     console.log(`topology: positions in ${PERSIST}${fs.existsSync(PERSIST) ? '' : ' (not yet created)'}`);
     const g = cacheStat.counts.ground || 0,
         c = cacheStat.counts.canopy || 0;

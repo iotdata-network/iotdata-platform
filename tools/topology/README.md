@@ -16,15 +16,76 @@ paper and one that closes in the field.
 | `lm-terrain-ground` | Fills the terrain cache with the ground model. Node, no dependencies. |
 | `lm-terrain-canopy` | Adds the vegetation layer. Python — the payload is LAZ. |
 
-Run the two cache builders once for a site, then the server reads only the local cache:
+Run the two cache builders once for a site, then the server reads only the local cache. Name the
+site once and all three find its files (see [Deployments](#deployments)):
 
 ```sh
-LM_USERPASS="user:pass" ./lm-terrain-ground  --state topology.json --radius 1000
-LM_USERPASS="user:pass" ./lm-terrain-canopy  --state topology.json --radius 1000
+export IOTDATA_DEPLOYMENT=se-67194
+LM_USERPASS="user:pass" ./lm-terrain-ground  --radius 1000
+LM_USERPASS="user:pass" ./lm-terrain-canopy  --radius 1000
 MAPS_API_KEY=... ./topology --port 4096
 ```
 
 `--help` on any of them lists the options. `lm-terrain-canopy` needs `pip install 'laspy[lazrs]' numpy requests`.
+
+## Deployments
+
+One copy of the tools serves every site: the programs stay here, and each deployment keeps its own
+files. Name the deployment with `--deployment` or `IOTDATA_DEPLOYMENT` (the option wins), either as a
+path, used as given, or as a bare name found in the `iotdata-deploy` tree beside this
+`iotdata-platform`:
+
+| | |
+|---|---|
+| `IOTDATA_DEPLOYMENT=se-67194` | `…/iotdata-deploy/se-67194` |
+| `IOTDATA_DEPLOYMENT=/opt/iotdata/src/iotdata-deploy/se-67194` | that directory |
+
+A deployment's files are in its `topology/` subdirectory, which is used when it exists; a directory
+without one is taken as-is, so a layout directory can also be named directly. Named by neither, it is
+the current directory, as before. What lives there:
+
+| | |
+|---|---|
+| `topology.json` | the layout: gateways, relays, sensors, settings. Edited on the page, worth committing |
+| `survey.json` | the current walk survey, kept separate so the layout's history is not walk data |
+| `survey-<time>.json` | earlier walks, archived by *new walk* |
+| `cache/` | the terrain blocks |
+
+`--persist`, `--survey`, `--cache` and the builders' `--state` still override a file individually.
+The resolution lives in `lib/deploy.js` (and is mirrored in `lm-terrain-canopy`), so the three cannot
+disagree about where a site is.
+
+## Walk survey
+
+The page plots a survey instrument's reports live: each press of its button becomes a numbered point
+where it was pressed, joined to the last by a trail, filled by the best signal heard there (green
+from −95 dBm, amber to −110, red below). Hovering a point, or pinning it, shows the same panel the
+nodes use with the question turned round: each station it heard, strongest first, with its distance
+and bearing from that point, and the RSSI.
+
+Reports come off MQTT, as the gateways publish them: one message per station heard on
+`<prefix>/manage/from/<station>`, `"type":"survey"`, naming the instrument as `observer` and carrying
+where it stood. The server groups them back into reports by instrument, timestamp and position.
+Every gateway that hears a report publishes it, so an observation can arrive once per path; its
+(observer, station, sequence) is its identity and only the first copy counts.
+
+| | |
+|---|---|
+| `--mqtt HOST` | broker, default `localhost`; `none` switches it off. A broker that is not there is said once and retried quietly — the map works as it did without it |
+| `--mqtt-topic T` | default `iotdata/manage/from/#` |
+| `--survey PATH` | default `<deployment>/survey.json`, written as reports arrive, so a restart mid-walk loses nothing |
+| `--stations PATH` | station names, read from a gateway monitor config's `station-<id>-name` lines; default `/etc/default/iotdata-gateway-monitor` |
+
+MQTT is read through `mosquitto_sub`, so the server keeps to no dependencies.
+
+A station is placed on the map by name: its monitor name is matched against layout names by their
+words, in any order (`bastu-relay` is the layout's `relay-bastu`); failing that, the longest layout
+name it starts with (`storage-room-sim-1` sits at `storage-room`). Give a layout entry a `station`
+field, the hex id, to settle it outright. A station that matches nothing is still listed, without a
+distance.
+
+*New walk* on the page archives the current one to `survey-<time>.json` beside it and starts empty;
+nothing is discarded.
 
 ## Secrets, and which program holds which
 
@@ -101,6 +162,7 @@ the budget towards SF7 to sharpen it.
 | `lib/blocks.js` | The cache: block keying, quantisation, deflate, memory ceiling |
 | `lib/sweref.js` | WGS84 ↔ SWEREF 99 TM (EPSG:3006), accurate to millimetres anywhere in Sweden |
 | `lib/cog.js` | Just enough TIFF to pull float32 elevations from a tiled, deflated, predictor-encoded COG over HTTP byte ranges. No GDAL on purpose |
+| `lib/deploy.js` | Which directory a deployment's files are in, for every program here |
 
-Positions persist to `--persist` (default `./topology.json`), which is also what the cache builders
-read to decide which blocks to fetch.
+Positions persist to `--persist` (default `<deployment>/topology.json`), which is also what the cache
+builders read to decide which blocks to fetch.

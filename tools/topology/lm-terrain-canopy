@@ -36,8 +36,12 @@ GROUND_RES, CANOPY_RES = 1, 2
 UNKNOWN = 255
 
 ap = argparse.ArgumentParser(add_help=True)
-ap.add_argument("--state", default="./topology.json", help="state file(s), comma separated")
-ap.add_argument("--cache", default="./cache")
+# One copy of the tool, many sites: defaults are found in the deployment's topology/. Same rules as
+# lib/deploy.js -- a path is used as given, a bare name is found under the iotdata-deploy tree.
+ap.add_argument("--deployment", default=os.environ.get("IOTDATA_DEPLOYMENT", ""),
+                help="the deployment: a path, or a name under iotdata-deploy (or IOTDATA_DEPLOYMENT; default the current directory)")
+ap.add_argument("--state", default=None, help="state file(s), comma separated (default <deployment>/topology.json)")
+ap.add_argument("--cache", default=None, help="cache directory (default <deployment>/cache)")
 ap.add_argument("--radius", type=float, default=1000)
 # Taking the highest return per cell is what makes this a surface model, and it is also what makes
 # it vulnerable to a single bad point: one bird or cloud return becomes a wall across the cell. The
@@ -54,6 +58,21 @@ ap.add_argument("--despeckle", type=float, default=10.0,
 ap.add_argument("--force", action="store_true")
 ap.add_argument("--dry-run", action="store_true")
 args = ap.parse_args()
+
+
+def deployment_dir(name):
+    if not name:
+        return os.getcwd()
+    root = Path(__file__).resolve().parent.parent.parent.parent / "iotdata-deploy"
+    d = Path(name).resolve() if os.path.isabs(name) or name.startswith(".") else root / name
+    return str(d / "topology") if (d / "topology").is_dir() else str(d)
+
+
+args.deployment = deployment_dir(args.deployment)
+if args.state is None:
+    args.state = os.path.join(args.deployment, "topology.json")
+if args.cache is None:
+    args.cache = os.path.join(args.deployment, "cache")
 
 CACHE = Path(args.cache).resolve()
 USERPASS = os.environ.get("LM_USERPASS", "")
