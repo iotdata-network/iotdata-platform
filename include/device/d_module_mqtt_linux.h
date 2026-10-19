@@ -51,6 +51,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <sys/socket.h>
+
 #include <mosquitto.h>
 
 // ------------------------------------------------------------------------------------------------------------------------
@@ -142,6 +146,16 @@ static bool _mqtt_parse_server_string(const char *string, char *host, const int 
         *port = atoi(port_str + 1);
     }
     return true;
+}
+
+static bool _mqtt_resolve_ipv4(const char *const host, char *const addr, const size_t size) {
+    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM }, *res = NULL;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || res == NULL)
+        return false;
+    struct sockaddr_in sin; /* copied, not cast: sockaddr is less aligned than sockaddr_in */
+    memcpy(&sin, res->ai_addr, sizeof(sin));
+    freeaddrinfo(res);
+    return inet_ntop(AF_INET, &sin.sin_addr, addr, (socklen_t)size) != NULL;
 }
 
 // ------------------------------------------------------------------------------------------------------------------------
@@ -382,7 +396,10 @@ bool mqtt_begin(const mqtt_config_t *cfg) {
         PRINTF_ERROR("mqtt: error parsing details in '%s'\n", cfg->server);
         return false;
     }
-    PRINTF_INFO("mqtt: connecting (host='%s', port=%d, ssl=%s, client='%s')\n", host, port, ssl ? "true" : "false", cfg->client);
+    /* not for TLS: the certificate is checked against the name */
+    char addr[INET_ADDRSTRLEN] = "";
+    const bool by_addr = !ssl && _mqtt_resolve_ipv4(host, addr, sizeof(addr)) && strcmp(addr, host) != 0;
+    PRINTF_INFO("mqtt: connecting (host='%s'%s%s, port=%d, ssl=%s, client='%s')\n", host, by_addr ? " -> " : "", addr, port, ssl ? "true" : "false", cfg->client);
     char client_id[24];
     snprintf(client_id, sizeof(client_id), "%s-%06X", cfg->client ? cfg->client : "mqtt-linux", (unsigned int)(hw_clock() ^ getpid()) & 0xFFFFFF);
     mosquitto_lib_init();
@@ -409,7 +426,7 @@ bool mqtt_begin(const mqtt_config_t *cfg) {
     st->reconnect_delay_current = st->reconnect_delay_base;
     st->reconnect_next_attempt = 0;
     int result;
-    if ((result = mosquitto_connect(st->mosq, host, port, MQTT_CONNECT_TIMEOUT)) != MOSQ_ERR_SUCCESS) {
+    if ((result = mosquitto_connect(st->mosq, by_addr ? addr : host, port, MQTT_CONNECT_TIMEOUT)) != MOSQ_ERR_SUCCESS) {
         PRINTF_ERROR("mqtt: error connecting to broker: %s\n", mosquitto_strerror(result));
         mosquitto_destroy(st->mosq);
         st->mosq = NULL;

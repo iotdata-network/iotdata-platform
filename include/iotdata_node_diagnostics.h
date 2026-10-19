@@ -356,6 +356,18 @@ static inline uint8_t iotdata_node_diagnostics_reason(const uint32_t count) {
 #ifndef IOTDATA_NODE_DIAGNOSTICS_PERSIST_MAX
 #define IOTDATA_NODE_DIAGNOSTICS_PERSIST_MAX 256u
 #endif
+/* Whether a DEVICE records from boot. ON in a development build, OFF in a release one (D_BUILD_RELEASE):
+   compiled in and advertised either way, but a field node does not record until it is told to --
+   and until then the recorder is not STARTED at all, because on ESP_FLASH starting is a scan of the
+   whole partition, and a node that deep sleeps starts at every wake. A host says for itself, through
+   iotdata_node_diagnostics_begin_conf. */
+#ifndef IOTDATA_NODE_DIAGNOSTICS_ENABLED
+#if defined(D_BUILD_RELEASE) && D_BUILD_RELEASE
+#define IOTDATA_NODE_DIAGNOSTICS_ENABLED false
+#else
+#define IOTDATA_NODE_DIAGNOSTICS_ENABLED true
+#endif
+#endif
 
 /* RTC_NOINIT_ATTR, so the pool survives a reset and a panic is still readable afterwards. No
    platform test and no esp_attr.h include: the attribute comes from the includer's d_platform_*
@@ -382,7 +394,7 @@ static blackbox_config_t _iotdata_node_diagnostics_config = {
     .flush = IOTDATA_NODE_DIAGNOSTICS_FLUSH,
     .flush_ms = IOTDATA_NODE_DIAGNOSTICS_FLUSH_MS,
     .persist_arg = IOTDATA_NODE_DIAGNOSTICS_PARTITION,
-    .enabled = true, /* compiled in == collecting; the compile-time knob is the gate */
+    .enabled = IOTDATA_NODE_DIAGNOSTICS_ENABLED,
 };
 
 /* And the store's name is copied in, for the same reason: the FILE backend keeps the POINTER it is
@@ -427,6 +439,8 @@ static inline bool _iotdata_node_diagnostics_start(const iotdata_node_bb_lc_even
 }
 
 static inline bool iotdata_node_diagnostics_begin(const uint8_t reason, const bool cold) {
+    if (!_iotdata_node_diagnostics_config.enabled)
+        return true; /* off from boot, by choice, not failure: started only when asked to be -- see IOTDATA_NODE_DIAGNOSTICS_ENABLED */
     return _iotdata_node_diagnostics_start(cold ? IOTDATA_NODE_BB_LC_BOOT : IOTDATA_NODE_BB_LC_WAKE, reason);
 }
 
@@ -529,6 +543,10 @@ static inline void iotdata_node_diagnostics_flush(void) {
 static inline void iotdata_node_diagnostics_enable(const bool on) {
     if (_iotdata_node_diagnostics_ready)
         blackbox_enable(&_iotdata_node_diagnostics_handle, on);
+    else if (on) { /* off from boot and so never started: start it now, for the rest of this boot */
+        _iotdata_node_diagnostics_config.enabled = true;
+        (void)_iotdata_node_diagnostics_start(IOTDATA_NODE_BB_LC_START, 0);
+    }
 }
 
 static inline void iotdata_node_diagnostics_clear(void) {
@@ -666,15 +684,17 @@ static const uint8_t iotdata_node_diagnostics_control_actions[] = { IOTDATA_NODE
 #define IOTDATA_NODE_DIAGNOSTICS_CONTROL               iotdata_node_diagnostics_node_control
 
 static inline bool iotdata_node_diagnostics_control(const uint8_t subject, const uint8_t action, const uint8_t *const args, const uint8_t arglen) {
+    /* ENABLE ahead of the ready test: a recorder that is off from boot was never started, and enabling
+       it is what starts it */
+    if (subject == IOTDATA_NODE_TLV_DIAGNOSTICS && action == IOTDATA_NODE_ACTION_DIAG_BBOX_ENABLE) {
+        const bool on = (arglen >= 1) ? (args[0] != 0u) : true;
+        iotdata_node_diagnostics_enable(on);
+        _iotdata_node_diagnostics_say(!on ? "diag: disabled" : _iotdata_node_diagnostics_ready ? "diag: enabled" : "diag: enable failed -- the store would not open");
+        return true;
+    }
     if (_iotdata_node_diagnostics_ready)
         if (subject == IOTDATA_NODE_TLV_DIAGNOSTICS)
             switch (action) {
-            case IOTDATA_NODE_ACTION_DIAG_BBOX_ENABLE: {
-                const bool on = (arglen >= 1) ? (args[0] != 0u) : true;
-                iotdata_node_diagnostics_enable(on);
-                _iotdata_node_diagnostics_say(on ? "diag: enabled" : "diag: disabled");
-                return true;
-            }
             case IOTDATA_NODE_ACTION_DIAG_BBOX_CLEAR:
                 iotdata_node_diagnostics_clear();
                 _iotdata_node_diagnostics_say("diag: cleared");

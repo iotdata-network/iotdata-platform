@@ -59,7 +59,7 @@ int main(void) {
     printf("the three groups compose, and the ids do not collide\n");
     /* the build-time switch in iotdata_node_config.h is what actually proves this: a reused id is a
        duplicate case label and this file would not have compiled. The count is the visible half. */
-    CHECK(IOTDATA_NODE_CFG_COUNT == 29, "three down + four common + twelve relay + nine ack + one gateway");
+    CHECK(IOTDATA_NODE_CFG_COUNT == 31, "three down + four common + twelve relay + nine ack + three gateway");
     CHECK(IOTDATA_NODE_CFG_DOWN_TTL_MIN == 0x020, "the downstream hold store at 0x020 -- not mesh: a gateway with no mesh still holds");
     CHECK(IOTDATA_NODE_CFG_MESH_ENABLE == 0x040, "common is based at 0x040");
     CHECK(IOTDATA_NODE_CFG_MESH_HYSTERESIS_DB == 0x051, "relay at 0x05x");
@@ -69,6 +69,7 @@ int main(void) {
     CHECK(IOTDATA_NODE_CFG_MESH_PEER_TTL_ROUNDS == 0x042 && IOTDATA_NODE_CFG_MESH_PARENT_MISS_ROUNDS == 0x050, "same ids, new unit");
     CHECK(IOTDATA_NODE_CFG_MESH_REPORT_PEERS_MS == 0x05B, "the neighbour-report cadence paces a FRAME, so it is mesh config and not the app's");
     CHECK(IOTDATA_NODE_CFG_MESH_BEACON_INTERVAL_S == 0x060, "gateway at 0x060");
+    CHECK(IOTDATA_NODE_CFG_MESH_ACK_DIRECT == 0x061 && IOTDATA_NODE_CFG_MESH_ACK_DIRECT_SLOT == 0x062, "the direct ack with it: a gateway's, so 0x06x");
     CHECK(IOTDATA_NODE_CFG_MESH_ACK_MAX_RETRIES == 0x070, "the relay ack block at 0x070 -- a SECOND range, not a renumbering of the first");
 
     printf("\ndefaults are the values the code used as #defines\n");
@@ -77,7 +78,8 @@ int main(void) {
     CHECK(iotdata_node_config_u8(MESH_PARENT_MISS_ROUNDS) == 3u, "parent loss, likewise -- see NOTES_ISSUES.md I.1");
     CHECK(iotdata_node_config_u8(MESH_HYSTERESIS_DB) == 10, "hysteresis");
     CHECK(iotdata_node_config_u8(MESH_TTL_INIT) == IOTDATA_MESH_TTL_DEFAULT, "ttl from the protocol's own default");
-    CHECK(iotdata_node_config_u16(MESH_BEACON_INTERVAL_S) == 60u, "beacon cadence, in seconds as the root has always had it");
+    CHECK(iotdata_node_config_u16(MESH_BEACON_INTERVAL_S) == 150u, "beacon cadence, in seconds: 150, for a planned network that rarely loses a parent");
+    CHECK(iotdata_node_config_bool(MESH_ACK_DIRECT) && iotdata_node_config_u8(MESH_ACK_DIRECT_SLOT) == 0u, "direct acks on, in the slot the station id gives");
     CHECK(iotdata_node_config_bool(MESH_ENABLE), "meshing on by default here; a gateway overrides that");
 
     printf("\na min/max pair is judged as a pair, whichever half arrives\n");

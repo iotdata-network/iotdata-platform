@@ -8,8 +8,8 @@ const char *__tag_device_ltr390 = "device-ltr390";
 
 // ------------------------------------------------------------------------------------------------------------------------
 
-// Resolution 16-bit (conversion time 50ms), Measurement Rate 50ms
-#define LTR390_MEAS_RATE_VAL_CONFIG 0b01000001
+// Resolution 16-bit (conversion time 25ms), Measurement Rate 25ms: a sample as soon as it converts
+#define LTR390_MEAS_RATE_VAL_CONFIG 0b01000000
 // GAIN: 3x (good balance for outdoor)
 #define LTR390_GAIN_VAL_CONFIG      0x01 // 3x
 
@@ -25,6 +25,10 @@ const char *__tag_device_ltr390 = "device-ltr390";
 #define LTR390_LUX_MAX (200000.0f)
 #define LTR390_UVI_MIN (0.0f)
 #define LTR390_UVI_MAX (25.0f)
+
+#ifndef LTR390_DARK_LUX
+#define LTR390_DARK_LUX (10.0f)
+#endif
 
 const reading_strategy_t STRAT_LTR390_LUX_DEFAULT = {
     .num_total = 5,
@@ -57,9 +61,15 @@ typedef struct {
 typedef struct {
     uint8_t i2c_addr;
     reading_strategy_t strategy_lux, strategy_uvi;
+    float dark_lux; /* lux below which UV is not measured, and reads 0 -- see LTR390_DARK_LUX; 0 = always */
 } ltr390_config_t;
 
-const ltr390_config_t ltr390_config_default = { .i2c_addr = LTR390_I2C_ADDR, .strategy_lux = STRAT_LTR390_LUX_DEFAULT, .strategy_uvi = STRAT_LTR390_UVI_DEFAULT };
+const ltr390_config_t ltr390_config_default = {
+    .i2c_addr = LTR390_I2C_ADDR,
+    .strategy_lux = STRAT_LTR390_LUX_DEFAULT,
+    .strategy_uvi = STRAT_LTR390_UVI_DEFAULT,
+    .dark_lux = LTR390_DARK_LUX,
+};
 
 // ------------------------------------------------------------------------------------------------------------------------
 
@@ -315,8 +325,13 @@ esp_err_t ltr390_read(ltr390_reading_t *const out, const int opts, const reading
             else
                 ESP_LOGW(__tag_device_ltr390, "reading %d (lux) failed, skipping", i);
         }
+    if (lux_count > 0)
+        readings_process(lux_arr, lux_count, st_lux, &out->lux_quality);
 
-    if (_ltr390_set_mode(true) != ESP_OK)
+    const bool dark = _LTR390_CONFIG(dark_lux) > 0.0f && lux_count > 0 && out->lux_quality.valid && out->lux_quality.value < _LTR390_CONFIG(dark_lux);
+    if (dark)
+        out->uvi_quality = (reading_result_t){ .value = 0.0f, .valid = true };
+    else if (_ltr390_set_mode(true) != ESP_OK)
         ESP_LOGW(__tag_device_ltr390, "UVS mode set failed, skipping uvi readings");
     else
         for (int i = 0; i < MIN_INT(st_uvi->num_total, READINGS_MAX); i++) {
@@ -328,21 +343,18 @@ esp_err_t ltr390_read(ltr390_reading_t *const out, const int opts, const reading
 
     ESP_RETURN_ON_FALSE(lux_count > 0 || uvi_count > 0, DEV_ERR_BAD_READING, __tag_device_ltr390, "ltr390_read");
 
-    if (lux_count <= 0)
-        out->lux = nanf("");
-    else {
-        readings_process(lux_arr, lux_count, st_lux, &out->lux_quality);
-        out->lux = out->lux_quality.value;
-    }
+    out->lux = (lux_count > 0) ? out->lux_quality.value : nanf("");
 
-    if (uvi_count <= 0)
+    if (dark)
+        out->uvi = 0.0f;
+    else if (uvi_count <= 0)
         out->uvi = nanf("");
     else {
         readings_process(uvi_arr, uvi_count, st_uvi, &out->uvi_quality);
         out->uvi = out->uvi_quality.value;
     }
 
-    ESP_LOGI(__tag_device_ltr390, "lux=%.1f uvi=%.2f", (double)out->lux, (double)out->uvi);
+    ESP_LOGI(__tag_device_ltr390, "lux=%.1f uvi=%.2f%s", (double)out->lux, (double)out->uvi, dark ? " (dark: uv not measured)" : "");
 
     return ESP_OK;
 }

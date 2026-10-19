@@ -155,6 +155,7 @@ static bool _iapp_on_batt_changed(const iotdata_node_config_row_t *row, __attrib
 static void _iapp_node_status(const uint16_t station, iotdata_node_status_t *const out);
 static bool _iapp_node_transmit(const uint8_t *const packet, const size_t len);
 static int _iapp_node_config_build(uint8_t *buf, size_t size, iotdata_node_partial_t *partial);
+static int _iapp_node_config_build_written(uint8_t *buf, size_t size);
 static bool _iapp_node_config_apply(const uint8_t *buf, size_t len, bool *reboot_out);
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -191,14 +192,15 @@ typedef struct {
     iotdata_node_version_caps_t caps;
     iotdata_node_t node;
     uint32_t restarts;
-    uint32_t tx_cycles;   /* wake cycles since the last restart              */
-    uint32_t tx_count;    /* packets transmitted                             */
-    uint32_t tx_errors;   /* packets the radio would not take                */
-    int16_t battery_mv;   /* last reading, for the charging trend bit        */
-    bool battery_present; /* a divider answered the probe at restart         */
-    bool lora_present;    /* E22 NVM configuration verified this power cycle */
-    uint16_t startup_owed; /* bit N = system TLV N still to report since the cold boot */
-    uint8_t startup_tries; /* cycles spent trying to send them                       */
+    uint32_t tx_cycles;        /* wake cycles since the last restart              */
+    uint32_t tx_count;         /* packets transmitted                             */
+    uint32_t tx_errors;        /* packets the radio would not take                */
+    int16_t battery_mv;        /* last reading, for the charging trend bit        */
+    bool battery_present;      /* a divider answered the probe at restart         */
+    bool lora_present;         /* E22 NVM configuration verified this power cycle */
+    uint16_t startup_owed;     /* bit N = system TLV N still to report since the cold boot */
+    uint8_t startup_tries;     /* cycles spent trying to send them                       */
+    uint64_t cycle_due_rtc_us; /* RTC time the NEXT deep-sleep cycle is due; 0 = unanchored */
     app_operating_t app;
 } iapp_operating_t;
 
@@ -226,6 +228,7 @@ static iapp_running_t _iapp_running = { .node_config = {
                                             .settings = &_iapp_running.node_settings,
                                             .state = &_iapp_running.node,
                                             .config_build = _iapp_node_config_build,
+                                            .config_build_written = _iapp_node_config_build_written,
                                             .config_apply = _iapp_node_config_apply,
                                             .packet_max = LORA_PACKET_SIZE_MAX,
                                         } };
@@ -283,7 +286,11 @@ extern const app_descr_t *app_spec;
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
 #ifndef CONSOLE_DRAIN_MS
+#if D_BUILD_RELEASE
+#define CONSOLE_DRAIN_MS 0 /* a release image: logging is compiled out, nothing to drain */
+#else
 #define CONSOLE_DRAIN_MS 100 /* let the console flush before deep sleep    */
+#endif
 #endif
 #ifndef RECEIVE_POLL_MS
 #define RECEIVE_POLL_MS 10 /* polling during the recieve window */
@@ -319,6 +326,9 @@ static bool _iapp_node_transmit(const uint8_t *const packet, const size_t len) {
 static int _iapp_node_config_build(uint8_t *const buf, const size_t size, iotdata_node_partial_t *const partial) {
     return iotdata_node_config_pack(buf, size, partial);
 }
+static int _iapp_node_config_build_written(uint8_t *const buf, const size_t size) {
+    return iotdata_node_config_pack_written(buf, size);
+}
 static bool _iapp_node_config_apply(const uint8_t *const buf, const size_t len, bool *const reboot_out) {
     return iotdata_node_config_apply(buf, len, &iapp_state.running->datastore, reboot_out);
 }
@@ -331,22 +341,6 @@ static void iapp_cycle_elapsed(iapp_state_t *const as, const uint32_t cycle_ms) 
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
-// THE SLEEP IS SCHEDULED, NOT MEASURED
-//
-// Cycle N is due at anchor + N*period on the tick counter, and the delay is whatever is LEFT until
-// that target. Deriving it instead from this cycle's measured length -- period minus awake -- makes
-// every millisecond spent after the measurement accumulate, because the next target moves with it.
-//
-// That is not theoretical: CONSOLE_DRAIN_MS was spent after `awake_ms` was taken and so sat outside
-// the budget, putting the real period at 300100ms against the 300000 asked for. Dead constant, which
-// is what a systematic offset looks like: 26 seconds a day, 13 minutes a month. Anchoring absorbs it
-// and anything else later added on this path, because `remain` is computed as late as possible.
-//
-// An overrun skips whole periods rather than shortening one, so a cycle that runs long loses its
-// slot but stays ON the original grid instead of dragging every later cycle off phase.
-//
-// NB: uint32 ms wraps at ~49.7 days. The unsigned subtraction then the cast to int32 handles it
-// correctly for any gap under ~24.8 days, which a sleep period will never approach.
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
 static uint32_t iapp_sleep_remaining(iapp_state_t *const as, const uint32_t start_ms, const uint32_t period_ms) {
@@ -363,6 +357,16 @@ static uint32_t iapp_sleep_remaining(iapp_state_t *const as, const uint32_t star
         remain = (int32_t)((uint32_t)remain + period_ms);
     }
     return (uint32_t)remain;
+}
+
+static uint64_t iapp_sleep_remaining_rtc(iapp_operating_t *const o, const uint32_t start_ms, const uint32_t period_ms) {
+    const uint64_t period_us = (uint64_t)period_ms * 1000u, now_us = esp_rtc_get_time_us();
+    if (o->cycle_due_rtc_us == 0u || o->cycle_due_rtc_us > now_us + period_us)
+        o->cycle_due_rtc_us = now_us - (uint64_t)(hw_time_ms() - start_ms) * 1000u; /* anchor where this cycle began */
+    o->cycle_due_rtc_us += period_us;
+    while (o->cycle_due_rtc_us <= now_us) /* overran: give up this slot, keep the phase */
+        o->cycle_due_rtc_us += period_us;
+    return o->cycle_due_rtc_us - now_us;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -563,7 +567,6 @@ static bool iapp_sleep(iapp_state_t *const as, const uint32_t start_ms, bool dee
         iotdata_node_diagnostics_flush();
         ESP_LOGI(__tag_iapp, "sleep light %" PRIu32 "ms (awake %" PRIu32 "ms) -- cycle %" PRIu32 ", tx=%" PRIu32 " errors=%" PRIu32, sleep_ms, awake_ms, as->operating->tx_cycles, as->operating->tx_count, as->operating->tx_errors);
         hw_delay_ms_yieldable(CONSOLE_DRAIN_MS);
-        /* AFTER the drain, so the drain is inside the period rather than added to it */
         hw_delay_ms_yieldable(iapp_sleep_remaining(as, start_ms, awake_ms + sleep_ms));
     } else {
         if (ad->func_sleep && ad->func_sleep(&app_state, node, &sleep_ms, start_ms, awake_ms, true) != IAPP_EV_OK)
@@ -573,14 +576,12 @@ static bool iapp_sleep(iapp_state_t *const as, const uint32_t start_ms, bool dee
         iotdata_node_diagnostics_flush();
         lora_hold();
         datastore_close(&as->running->datastore);
-        ESP_LOGI(__tag_iapp, "sleep deep %" PRIu32 "ms (awake %" PRIu32 "ms) -- cycle %" PRIu32 ", tx=%" PRIu32 " errors=%" PRIu32, sleep_ms, awake_ms, as->operating->tx_cycles, as->operating->tx_count, as->operating->tx_errors);
+        const uint64_t deep_us = iapp_sleep_remaining_rtc(as->operating, start_ms, awake_ms + sleep_ms);
+        ESP_LOGI(__tag_iapp, "sleep deep %" PRIu32 "ms (awake %" PRIu32 "ms) -- cycle %" PRIu32 ", tx=%" PRIu32 " errors=%" PRIu32, (uint32_t)(deep_us / 1000u), awake_ms, as->operating->tx_cycles, as->operating->tx_count,
+                 as->operating->tx_errors);
         hw_delay_ms_yieldable(CONSOLE_DRAIN_MS);
-        /* No grid to anchor to: deep sleep is a reboot and esp_timer restarts at zero, so the
-           absolute schedule above cannot reach across it. What IS fixable is the same drain
-           sitting outside the budget -- charge it to the sleep. The residual is the boot path,
-           which needs RTC time to measure and is a separate change. */
-        const uint32_t deep_ms = sleep_ms > CONSOLE_DRAIN_MS ? sleep_ms - CONSOLE_DRAIN_MS : sleep_ms;
-        esp_deep_sleep((uint64_t)deep_ms * 1000); /* does not return */
+        const uint64_t drain_us = (uint64_t)CONSOLE_DRAIN_MS * 1000u;
+        esp_deep_sleep(deep_us > drain_us ? deep_us - drain_us : deep_us); /* does not return */
     }
     return true;
 }
@@ -599,7 +600,7 @@ static void iapp_startup_reports(iapp_state_t *const as, const bool lora_started
                         ESP_LOGI(__tag_iapp, "startup: reported %s", iotdata_node_tlv_name(t));
                     } else
                         ESP_LOGW(__tag_iapp, "startup: report %s failed, will retry", iotdata_node_tlv_name(t));
-	        }
+                }
         if (o->startup_owed != 0u && ++o->startup_tries >= STARTUP_REPORT_TRIES) {
             ESP_LOGW(__tag_iapp, "startup: giving up on reports 0x%04" PRIX16 " after %u cycle(s)", o->startup_owed, (unsigned)o->startup_tries);
             o->startup_owed = 0u;

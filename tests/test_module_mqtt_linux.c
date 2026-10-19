@@ -203,6 +203,17 @@ static void test_an_empty_payload_is_delivered(void) {
     CHECK(sink_a.calls == 1 && sink_a.length == 0, "with length 0");
 }
 
+/* THE BROKER IS REACHED BY ITS IPv4 ADDRESS when it has one: the fleet's listens on nothing else, and
+   a lookup for either family can come back with IPv6 only. No network here -- localhost is in the
+   hosts table, and a literal is not looked up at all. */
+static void test_the_broker_is_found_by_its_ipv4_address(void) {
+    char a[INET_ADDRSTRLEN];
+    CHECK(_mqtt_resolve_ipv4("localhost", a, sizeof(a)) && strcmp(a, "127.0.0.1") == 0, "a name gives its IPv4 address, though ::1 may be listed first");
+    CHECK(_mqtt_resolve_ipv4("192.0.2.7", a, sizeof(a)) && strcmp(a, "192.0.2.7") == 0, "an IPv4 literal is itself");
+    CHECK(!_mqtt_resolve_ipv4("::1", a, sizeof(a)), "an IPv6 literal has none, and the caller connects by name as before");
+    CHECK(!_mqtt_resolve_ipv4("localhost", a, 4), "nor does an address that will not fit");
+}
+
 /* The client and its subscribers end together: the rows point at state the application tears down
    alongside the client, so a later mqtt_begin() must not replay them. Last in the suite, because it
    is the one test that ends the module. */
@@ -227,6 +238,7 @@ int main(void) {
     test_a_full_table_is_refused_and_says_so();
     test_unsubscribe_drops_the_row();
     test_an_empty_payload_is_delivered();
+    test_the_broker_is_found_by_its_ipv4_address();
     test_end_forgets_the_subscribers();
     if (fails > 0) {
         printf("\n%d FAILED\n", fails);

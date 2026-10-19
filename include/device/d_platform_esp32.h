@@ -40,6 +40,7 @@
 #include "esp_timer.h"
 #include "esp_cpu.h"
 #include "esp_random.h"
+#include "esp_rtc_time.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 /* <time.h> FOR hw_clock() BELOW, and it needs the suppression: IDF carries its own
@@ -50,6 +51,14 @@
 #pragma GCC diagnostic ignored "-Wredundant-decls"
 #include <time.h>
 #pragma GCC diagnostic pop
+
+// ------------------------------------------------------------------------------------------------------------------------
+
+#if defined(CONFIG_LOG_MAXIMUM_LEVEL) && CONFIG_LOG_MAXIMUM_LEVEL == 0
+#define D_BUILD_RELEASE 1
+#else
+#define D_BUILD_RELEASE 0
+#endif
 
 // ------------------------------------------------------------------------------------------------------------------------
 

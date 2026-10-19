@@ -103,18 +103,31 @@
 #ifndef IOTDATA_NODE_CONFIG_MESH_FORWARD_SUPPRESS
 #define IOTDATA_NODE_CONFIG_MESH_FORWARD_SUPPRESS 0 /* 0=ack 1=lower-cost 2=always */
 #endif
+/* 500-3000, not 200-1000: latency is cheap here, air time is not. At 2.4k a gateway's direct ACK
+   reaches a relay ~370ms after the frame, and a shorter floor forwards what the gateway already has
+   (lab: 26% of direct-ACKed frames at 200, 3% at 400). A wide window lets the first relay's forward,
+   and its ACK (~550ms), silence the others that heard the same frame. */
 #ifndef IOTDATA_NODE_CONFIG_MESH_FORWARD_BACKOFF_MIN_MS
-#define IOTDATA_NODE_CONFIG_MESH_FORWARD_BACKOFF_MIN_MS 200u
+#define IOTDATA_NODE_CONFIG_MESH_FORWARD_BACKOFF_MIN_MS 500u
 #endif
 #ifndef IOTDATA_NODE_CONFIG_MESH_FORWARD_BACKOFF_MAX_MS
-#define IOTDATA_NODE_CONFIG_MESH_FORWARD_BACKOFF_MAX_MS 1000u
+#define IOTDATA_NODE_CONFIG_MESH_FORWARD_BACKOFF_MAX_MS 3000u
 #endif
 #ifndef IOTDATA_NODE_CONFIG_MESH_FORWARD_EXPIRY_MS
 #define IOTDATA_NODE_CONFIG_MESH_FORWARD_EXPIRY_MS 3000u
 #endif
 
+/* 150s, not 60. A network here is planned and static: a relay goes in where a gap was found, so
+   losing a parent is the exception, and the cadence is paid for by every relay, once per round,
+   for ever. At 150s a lost parent is still noticed in 3 rounds (7.5 min) and a peer forgotten in 5. */
 #ifndef IOTDATA_NODE_CONFIG_MESH_BEACON_INTERVAL_S
-#define IOTDATA_NODE_CONFIG_MESH_BEACON_INTERVAL_S 60u
+#define IOTDATA_NODE_CONFIG_MESH_BEACON_INTERVAL_S 150u
+#endif
+#ifndef IOTDATA_NODE_CONFIG_MESH_ACK_DIRECT
+#define IOTDATA_NODE_CONFIG_MESH_ACK_DIRECT 1
+#endif
+#ifndef IOTDATA_NODE_CONFIG_MESH_ACK_DIRECT_SLOT
+#define IOTDATA_NODE_CONFIG_MESH_ACK_DIRECT_SLOT 0u /* 0 = from the station id */
 #endif
 
 #ifndef IOTDATA_NODE_CONFIG_MESH_ACK_MAX_RETRIES
@@ -183,6 +196,8 @@ static inline bool iotdata_node_config_mesh_changed(__attribute__((unused)) cons
 #define IOTDATA_NODE_CFGID_MESH_FORWARD_EXPIRY_MS         0x05A
 #define IOTDATA_NODE_CFGID_MESH_REPORT_PEERS_MS           0x05B
 #define IOTDATA_NODE_CFGID_MESH_BEACON_INTERVAL_S         0x060
+#define IOTDATA_NODE_CFGID_MESH_ACK_DIRECT                0x061
+#define IOTDATA_NODE_CFGID_MESH_ACK_DIRECT_SLOT           0x062
 
 #define IOTDATA_NODE_CFGID_MESH_ACK_MAX_RETRIES           0x070
 #define IOTDATA_NODE_CFGID_MESH_ACK_TIMEOUT_MS            0x071
@@ -263,7 +278,11 @@ static inline bool iotdata_node_config_mesh_changed(__attribute__((unused)) cons
  */
 #define IOTDATA_NODE_CONFIG_ENTRIES_MESH_GATEWAY(X) \
     X(MESH_BEACON_INTERVAL_S, IOTDATA_NODE_CFGID_MESH_BEACON_INTERVAL_S, U16, 5, 3600, IOTDATA_NODE_CONFIG_MESH_BEACON_INTERVAL_S, IOTDATA_NODE_CONFIG_FLAG_NONE, NULL, IOTDATA_NODE_CONFIG_MESH_NOTIFY, \
-      "how often the root beacons, which sets the whole tree's cadence")
+      "how often the root beacons, which sets the whole tree's cadence") \
+    X(MESH_ACK_DIRECT, IOTDATA_NODE_CFGID_MESH_ACK_DIRECT, BOOL, 0, 1, IOTDATA_NODE_CONFIG_MESH_ACK_DIRECT, IOTDATA_NODE_CONFIG_FLAG_NONE, NULL, IOTDATA_NODE_CONFIG_MESH_NOTIFY, \
+      "acknowledge sensor frames heard directly, so a relay that heard them too drops its forward") \
+    X(MESH_ACK_DIRECT_SLOT, IOTDATA_NODE_CFGID_MESH_ACK_DIRECT_SLOT, U8, 0, 4, IOTDATA_NODE_CONFIG_MESH_ACK_DIRECT_SLOT, IOTDATA_NODE_CONFIG_FLAG_NONE, NULL, IOTDATA_NODE_CONFIG_MESH_NOTIFY, \
+      "which 200ms slot that ack goes in, so two gateways do not talk over each other: 1 at once, 2-4 later, 0 from the station id")
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------

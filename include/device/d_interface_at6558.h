@@ -141,7 +141,9 @@ typedef struct {
     gnss_strategy_t strategy;
 } gnss_config_t;
 
-const gnss_config_t gnss_config_default = { .strategy = STRAT_GNSS_DEFAULT };
+const gnss_config_t gnss_config_default = {
+    .strategy = STRAT_GNSS_DEFAULT,
+};
 
 // ------------------------------------------------------------------------------------------------------------------------
 

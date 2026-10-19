@@ -858,54 +858,72 @@ static inline bool iotdata_node_config_update_commit(iotdata_node_config_update_
 // THE IMAGE: one encoder for the datastore and the wire
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static inline size_t iotdata_node_config_record_read(const uint8_t *const buf, const size_t len, uint16_t *const id_out, int *const index_out, iotdata_node_config_value_t *const val_out) {
-    if (index_out != NULL)
-        *index_out = -1;
+/* One record, read WITHOUT the table: its id, its type, and its value as the type says to read it --
+   which is all a gateway has for another node's rows, never compiled into it. A STRING is BORROWED
+   from buf. Returns the record's length, or 0 when it cannot be read (truncated, or a type with
+   neither a width nor a length), after which no later record can be found either. */
+static inline size_t iotdata_node_config_record_peek(const uint8_t *const buf, const size_t len, uint16_t *const id_out, uint8_t *const type_out, iotdata_node_config_value_t *const val_out) {
     if (buf == NULL || len < 3u)
         return 0;
     const uint16_t rec = (uint16_t)(((uint16_t)buf[0] << 8) | buf[1]);
     const uint8_t type = iotdata_node_config_rec_type(rec), w = iotdata_node_config_type_size(type);
-    const uint16_t id = iotdata_node_config_rec_id(rec);
-    if (id_out != NULL)
-        *id_out = id;
+    iotdata_node_config_value_t v = { 0 };
+    size_t n;
     /* A string is skippable by a build that has never heard of this id, which is the whole reason
        the length is on the wire and not only in the table. */
     if (type == IOTDATA_NODE_CONFIG_TYPE_STRING) {
-        const size_t n = buf[2];
-        if (len < 3u + n)
+        n = 3u + (size_t)buf[2];
+        if (len < n)
             return 0; /* truncated: stop rather than guess where the next record begins */
-        const int si = iotdata_node_config_index(id);
-        if (si >= 0 && iotdata_node_config_table[si].type == type && val_out != NULL) {
-            *val_out = (iotdata_node_config_value_t){ 0 };
-            val_out->s.p = (const char *)&buf[3]; /* BORROWED from the caller's buffer */
-            val_out->s.len = (uint16_t)n;
-            if (index_out != NULL)
-                *index_out = si;
-        }
-        return 3u + n;
-    }
-    if (w == 0 || len < (size_t)(2u + w))
-        return 0; /* unreadable: stop rather than guess where the next record begins */
-    const int i = iotdata_node_config_index(id);
-    if (i >= 0 && iotdata_node_config_table[i].type == type && val_out != NULL) {
+        v.s.p = (const char *)&buf[3];
+        v.s.len = buf[2];
+    } else {
+        n = (size_t)(2u + w);
+        if (w == 0 || len < n)
+            return 0; /* unreadable: stop rather than guess where the next record begins */
         uint64_t raw = 0;
         for (uint8_t b = 0; b < w; b++)
             raw = (raw << 8) | buf[2u + b];
-        *val_out = (iotdata_node_config_value_t){ 0 };
         if (type == IOTDATA_NODE_CONFIG_TYPE_FLOAT) {
             const uint32_t bits = (uint32_t)raw;
-            memcpy(&val_out->f, &bits, sizeof(float));
+            memcpy(&v.f, &bits, sizeof(float));
         } else if (iotdata_node_config_type_is_signed(type)) {
             const uint8_t shift = (uint8_t)(64u - 8u * w);
-            val_out->i = (int64_t)(raw << shift) >> shift; /* sign-extend */
+            v.i = (int64_t)(raw << shift) >> shift; /* sign-extend */
         } else if (type == IOTDATA_NODE_CONFIG_TYPE_BOOL)
-            val_out->b = (raw != 0u);
+            v.b = (raw != 0u);
         else
-            val_out->u = raw;
+            v.u = raw;
+    }
+    if (id_out != NULL)
+        *id_out = iotdata_node_config_rec_id(rec);
+    if (type_out != NULL)
+        *type_out = type;
+    if (val_out != NULL)
+        *val_out = v;
+    return n;
+}
+
+/* A record for THIS build: the value only for a row it has, at the type it has -- anything else is
+   skipped by its length, the ignore-unknown rule. */
+static inline size_t iotdata_node_config_record_read(const uint8_t *const buf, const size_t len, uint16_t *const id_out, int *const index_out, iotdata_node_config_value_t *const val_out) {
+    if (index_out != NULL)
+        *index_out = -1;
+    uint16_t id = 0;
+    uint8_t type = 0;
+    iotdata_node_config_value_t v = { 0 };
+    const size_t n = iotdata_node_config_record_peek(buf, len, &id, &type, &v);
+    if (n == 0)
+        return 0;
+    if (id_out != NULL)
+        *id_out = id;
+    const int i = iotdata_node_config_index(id);
+    if (i >= 0 && iotdata_node_config_table[i].type == type && val_out != NULL) {
+        *val_out = v;
         if (index_out != NULL)
             *index_out = i;
     }
-    return (size_t)(2u + w);
+    return n;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -988,13 +1006,12 @@ static inline int iotdata_node_config_pack(uint8_t *const buf, const size_t size
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-/* Apply a record stream that arrived over the air. All or nothing: one unacceptable value rejects
-   the whole update, because applying half of a radio reconfiguration is how a remote node is lost.
-   An UNKNOWN id is skipped rather than rejected -- it is the ignore-unknown rule, and the reply
-   says what actually took. Returns whether the update committed. */
+static bool _iotdata_node_config_written[IOTDATA_NODE_CFG_COUNT];
+
 static inline bool iotdata_node_config_apply(const uint8_t *const buf, const size_t len, datastore_t *const ds, bool *const reboot_out) {
     iotdata_node_config_update_t u;
     iotdata_node_config_update_begin(&u, true);
+    memset(_iotdata_node_config_written, 0, sizeof(_iotdata_node_config_written));
     for (size_t at = 0; at < len;) {
         uint16_t id = 0;
         int i = -1;
@@ -1002,11 +1019,27 @@ static inline bool iotdata_node_config_apply(const uint8_t *const buf, const siz
         const size_t n = iotdata_node_config_record_read(buf + at, len - at, &id, &i, &v);
         if (n == 0)
             break;
-        if (i >= 0)
+        if (i >= 0) {
+            _iotdata_node_config_written[i] = true;
             (void)iotdata_node_config_update_stage(&u, id, &v); /* a rejection poisons the whole update */
+        }
         at += n;
     }
     return iotdata_node_config_update_commit(&u, ds, reboot_out);
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+static inline int iotdata_node_config_pack_written(uint8_t *const buf, const size_t size) {
+    size_t at = 0;
+    for (int i = 0; i < (int)IOTDATA_NODE_CFG_COUNT; i++)
+        if (_iotdata_node_config_written[i]) {
+            const size_t n = iotdata_node_config_encode(i, buf + at, size - at);
+            if (n == 0)
+                break; /* cannot happen for a write that itself fitted one frame, but never overrun */
+            at += n;
+        }
+    return (int)at;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------

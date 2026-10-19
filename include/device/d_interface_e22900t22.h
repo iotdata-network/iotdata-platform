@@ -370,9 +370,14 @@ esp_err_t _lora_mode_set(const lora_mode_t mode) {
 
 void lora_hold(void) {
     if (!_LORA_IS_USB()) {
+        hw_gpio_set(PIN_DEVICE_LORA_M1, true);
+        hw_gpio_cfg_enable_output(PIN_DEVICE_LORA_M1);
         (void)gpio_hold_en(PIN_DEVICE_LORA_M1);
-        if (PIN_DEVICE_LORA_M0 != GPIO_NUM_NC)
+        if (PIN_DEVICE_LORA_M0 != GPIO_NUM_NC) {
+            hw_gpio_set(PIN_DEVICE_LORA_M0, true);
+            hw_gpio_cfg_enable_output(PIN_DEVICE_LORA_M0);
             (void)gpio_hold_en(PIN_DEVICE_LORA_M0);
+        }
         gpio_deep_sleep_hold_en();
     }
 }

@@ -119,6 +119,9 @@ typedef struct {
        leaves both NULL and answers a CONFIG request with an empty report, which is an answer. */
     iotdata_node_config_build_fn config_build;
     iotdata_node_config_apply_fn config_apply;
+    /* Optional: just the rows the last write named (iotdata_node_config_pack_written), which is what
+       a write is answered with. Absent, the answer is the whole table, as it always was. */
+    int (*config_build_written)(uint8_t *buf, size_t size);
 
     const uint8_t *control_actions;
     uint8_t control_actions_count;
@@ -408,8 +411,14 @@ static inline int iotdata_node_build_status(const iotdata_node_t *const n, uint8
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static inline int iotdata_node_build_config(const iotdata_node_t *const n, uint8_t *const buf, const size_t size, iotdata_node_partial_t *const partial) {
+/* CONFIG's scope, as STATUS has one: 0 is the whole table -- what a request is answered with -- and
+   WRITTEN is the rows a write named, which is what the write is answered with. */
+#define IOTDATA_NODE_CONFIG_SCOPE_WRITTEN 1u
+
+static inline int iotdata_node_build_config(const iotdata_node_t *const n, uint8_t *const buf, const size_t size, const uint8_t scope, iotdata_node_partial_t *const partial) {
     const iotdata_node_params_t *const cfg = n->cfg;
+    if (scope == IOTDATA_NODE_CONFIG_SCOPE_WRITTEN && cfg->config_build_written)
+        return cfg->config_build_written(buf, size);
     if (cfg->config_build)
         return cfg->config_build(buf, size, partial);
     return 0;
@@ -477,7 +486,7 @@ static inline int iotdata_node_build(const iotdata_node_t *const n, const uint8_
     case IOTDATA_NODE_TLV_STATUS:
         return iotdata_node_build_status(n, buf, size, scope);
     case IOTDATA_NODE_TLV_CONFIG:
-        return iotdata_node_build_config(n, buf, size, partial);
+        return iotdata_node_build_config(n, buf, size, scope, partial);
     case IOTDATA_NODE_TLV_CONTROL:
         return iotdata_node_build_control(n, buf, size);
     case IOTDATA_NODE_TLV_DIAGNOSTICS:
@@ -552,7 +561,7 @@ static inline void iotdata_node_process_config(iotdata_node_t *const n, const ui
     n->stat_commands++;
     if (cfg->config_apply)
         (void)cfg->config_apply(kv, kvlen, reboot_out);
-    (void)iotdata_node_report_scoped(n, IOTDATA_NODE_TLV_CONFIG, 0);
+    (void)iotdata_node_report_scoped(n, IOTDATA_NODE_TLV_CONFIG, IOTDATA_NODE_CONFIG_SCOPE_WRITTEN); /* what it named, not the table */
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------

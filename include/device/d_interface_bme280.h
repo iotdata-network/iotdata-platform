@@ -73,7 +73,12 @@ typedef struct {
     reading_strategy_t strategy_temp, strategy_pres, strategy_humi;
 } bme280_config_t;
 
-const bme280_config_t bme280_config_default = { .i2c_addr = BME280_I2C_ADDR, .strategy_temp = STRAT_BME280_TEMP_DEFAULT, .strategy_pres = STRAT_BME280_PRES_DEFAULT, .strategy_humi = STRAT_BME280_HUMI_DEFAULT };
+const bme280_config_t bme280_config_default = {
+    .i2c_addr = BME280_I2C_ADDR,
+    .strategy_temp = STRAT_BME280_TEMP_DEFAULT,
+    .strategy_pres = STRAT_BME280_PRES_DEFAULT,
+    .strategy_humi = STRAT_BME280_HUMI_DEFAULT,
+};
 
 // ------------------------------------------------------------------------------------------------------------------------
 

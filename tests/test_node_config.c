@@ -189,6 +189,24 @@ int main(void) {
         CHECK(n > 0 && p.chunk == IOTDATA_NODE_CFG_COUNT, "every row is in the report, local ones included");
     }
 
+    printf("\na record read without the table: all a gateway has of another node's rows\n");
+    {
+        const uint8_t rec[] = {
+            0x7F, 0xE5, 0x00, 0x00, 0x01, 0xF4, /* 0x7FE u32 = 500: no such row in this build */
+            0x7F, 0xD2, 0xFB,                   /* 0x7FD i8 = -5 */
+            0x7F, 0xCA, 0x02, 'h',  'i',        /* 0x7FC string = "hi" */
+        };
+        uint16_t id = 0;
+        uint8_t type = 0;
+        int i = 0;
+        iotdata_node_config_value_t v;
+        CHECK(iotdata_node_config_record_peek(rec, sizeof(rec), &id, &type, &v) == 6 && id == 0x7FE && type == IOTDATA_NODE_CONFIG_TYPE_U32 && v.u == 500, "a row this build does not have is still read");
+        CHECK(iotdata_node_config_record_read(rec, sizeof(rec), &id, &i, &v) == 6 && i == -1, "where record_read skips it, by the same length");
+        CHECK(iotdata_node_config_record_peek(rec + 6, 3, &id, &type, &v) == 3 && v.i == -5, "signed, sign-extended");
+        CHECK(iotdata_node_config_record_peek(rec + 9, 5, &id, &type, &v) == 5 && v.s.len == 2 && memcmp(v.s.p, "hi", 2) == 0, "a string by its own length, borrowed");
+        CHECK(iotdata_node_config_record_peek(rec, 5, &id, &type, &v) == 0, "and a truncated record is not read at all");
+    }
+
     datastore_close(&ds);
     printf("\n%s\n", fails == 0 ? "all ok" : "FAILED");
     return fails == 0 ? 0 : 1;
