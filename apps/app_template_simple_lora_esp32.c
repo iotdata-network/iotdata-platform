@@ -292,6 +292,9 @@ extern const app_descr_t *app_spec;
 #define CONSOLE_DRAIN_MS 100 /* let the console flush before deep sleep    */
 #endif
 #endif
+#ifndef BROWNOUT_SLEEP_MS
+#define BROWNOUT_SLEEP_MS 300000u /* the brownout guard's sleep, for an app with no sleep of its own */
+#endif
 #ifndef RECEIVE_POLL_MS
 #define RECEIVE_POLL_MS 10 /* polling during the recieve window */
 #endif
@@ -463,6 +466,22 @@ static bool iapp_init(iapp_state_t *const as) {
     if (reset_reason == ESP_RST_BROWNOUT && brownout_mv > 0) {
         power_startup(brownout_mv);
         ESP_LOGE(__tag_iapp, "boot: BROWNOUT -- the last reading before it was %dmV", (int)brownout_mv);
+    }
+
+    // THE BROWNOUT GUARD. A brownout is usually the radio's own transmit current pulling a weak supply
+    // under, and carrying on would only transmit again: a reset loop. So straight back to deep sleep
+    // for a cycle, no sensors and no radio, and the next ordinary wake tries again. The sequence is
+    // left alone -- whether the frame that browned out ever went out is unknowable.
+    if (reset_reason == ESP_RST_BROWNOUT) {
+        uint32_t sleep_ms = 0;
+        if (!ad->func_sleep || ad->func_sleep(&app_state, node, &sleep_ms, hw_time_ms(), 0, true) != IAPP_EV_OK || sleep_ms == 0)
+            sleep_ms = BROWNOUT_SLEEP_MS;
+        ESP_LOGE(__tag_iapp, "boot: BROWNOUT -- straight back to deep sleep for %" PRIu32 "ms, no sensors, no radio", sleep_ms);
+        iotdata_node_diagnostics_event(IOTDATA_NODE_BB_LC_SLEEP, iotdata_node_diagnostics_reason(sleep_ms / 1000));
+        iotdata_node_diagnostics_flush();
+        lora_hold();
+        hw_delay_ms_yieldable(CONSOLE_DRAIN_MS);
+        esp_deep_sleep((uint64_t)sleep_ms * 1000u); /* does not return */
     }
 
     // any app specific entry activities, failable

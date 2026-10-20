@@ -73,6 +73,9 @@
   .tog.on { background:var(--acc); border-color:var(--acc); color:#06222c }
   .tog.busy { opacity:.5; pointer-events:none }
   #hover h2 .tog + .x { margin-left:4px }
+  .svnav { color:var(--mut); font-weight:400 }
+  .svnav a { cursor:pointer; padding:0 3px; color:var(--fg) }
+  .svnav a.off { opacity:.3; cursor:default }
   .probeline { font:11px/1.4 ui-monospace,monospace; color:var(--acc); margin-top:5px;
                display:flex; align-items:center; gap:6px }
   .probeline .x { font-size:13px }
@@ -183,8 +186,9 @@
     <details open><summary>walk survey</summary><div class="body">
       <div class="hint" id="svinfo">waiting for the server</div>
       <div class="row" style="margin-top:6px"><button id="svfit">show walk</button><button id="svclear">new walk</button></div>
-      <div class="hint">Each press of the survey button lands here as a point, joined in walk order.
-        Hover or click one for what it heard there, strongest first.</div>
+      <div class="hint">Each survey report lands here as a point, joined in walk order.
+        Hover or click one for what it heard there, strongest first, beside what the model predicts;
+        once one is pinned, &lsaquo; &rsaquo; or the arrow keys step along the walk.</div>
     </div></details>
     <div class="row">
       <button class="p" id="save">save</button><button id="reload">reload</button><button id="print">print</button>
@@ -222,7 +226,7 @@ let map, S = null, elev = null, marks = { nodes: [], sensors: [] }, rings = [], 
 let pin = null, shown = null, sel = null, dragging = false;
 /* the walk survey: reports from the server, and their markers */
 let SV = { reports: [], stations: {}, mqtt: null }, svMarks = [], svTrail = null;
-const SURVEYC = '#b48cff';
+const SURVEYC = '#ffffff'; /* white: on this map, white is the current activity */
 const $ = (id) => document.getElementById(id);
 const colourOf = (kind, i) => kind === 'nodes' ? COLOURS[i % COLOURS.length] : SENSOR;
 const msg = (t) => { $('msg').textContent = t;
@@ -719,25 +723,69 @@ function stationAt(id) {
 }
 const rssiCls = (r) => r == null ? '' : r >= -95 ? 'ok' : r >= -110 ? 'warn' : 'bad';
 
+/* The previous or next point along the walk that has a position, or -1 at either end. */
+function surveyNext(i, dir) {
+  for (let j = i + dir; j >= 0 && j < SV.reports.length; j += dir) if (SV.reports[j].lat != null) return j;
+  return -1;
+}
+/* Step to a point: pin its box and bring it to the middle of the map, so a walk reads point by point. */
+function surveyGo(j) {
+  if (!(pin && pin.kind === 'survey' && pin.i === j)) clickMark('survey', j);
+  map.panTo({ lat: SV.reports[j].lat, lng: SV.reports[j].lng });
+}
+
+/* The ground under each walk point, which the model needs -- the report's own altitude is GNSS, and
+   metres off the terrain it would be measured against. Asked once per point, as one batch. */
+const svAsked = new Set();
+async function surveyElev() {
+  const need = SV.reports.filter((r) => r.lat != null && r.elev === undefined && !svAsked.has(r.key));
+  if (!need.length) return;
+  for (const r of need) svAsked.add(r.key);
+  try {
+    const got = await prov().points(need.map((r) => ({ lat: r.lat, lng: r.lng })));
+    need.forEach((r, k) => { r.elev = got[k] ? got[k].z : null; });
+  } catch (e) {
+    for (const r of need) svAsked.delete(r.key);
+    return msg('survey elevations: ' + e.message);
+  }
+  if (shown && shown.kind === 'survey') surveyHover(shown.i);
+}
+
 async function surveyBoot() {
   try {
     const o = await (await fetch('/api/survey')).json();
     SV.reports = o.reports || []; SV.stations = o.stations || {}; SV.mqtt = o.mqtt || null;
   } catch { /* an older server: no walk, and nothing else changes */ }
   drawSurvey();
+  surveyElev();
   const es = new EventSource('/api/survey/events');
   es.addEventListener('mqtt', (ev) => { SV.mqtt = JSON.parse(ev.data); surveyInfo(); });
   es.addEventListener('report', (ev) => {
     const r = JSON.parse(ev.data), k = SV.reports.findIndex((x) => x.key === r.key);
-    if (k >= 0) SV.reports[k] = r; else SV.reports.push(r);
+    if (k >= 0) {
+      const old = SV.reports[k];
+      if (old.lat === r.lat && old.lng === r.lng) r.elev = old.elev; else svAsked.delete(r.key);
+      SV.reports[k] = r;
+    } else SV.reports.push(r);
     drawSurvey();
+    surveyElev();
     if (shown && shown.kind === 'survey') surveyHover(shown.i);
   });
   es.addEventListener('clear', () => {
     SV.reports = [];
+    svAsked.clear();
     if (shown && shown.kind === 'survey') unpin();
     drawSurvey();
   });
+  /* the arrow keys step a pinned survey box along the walk -- taken first, so the map does not pan too */
+  document.addEventListener('keydown', (e) => {
+    if (!pin || pin.kind !== 'survey' || (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight')) return;
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test((e.target && e.target.tagName) || '')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const j = surveyNext(pin.i, e.key === 'ArrowLeft' ? -1 : 1);
+    if (j >= 0) surveyGo(j);
+  }, true);
   $('svfit').onclick = () => {
     const pts = SV.reports.filter((r) => r.lat != null);
     if (!pts.length) return msg('no survey points yet');
@@ -782,14 +830,17 @@ function drawSurvey() {
   });
   if (path.length > 1) {
     if (svTrail) svTrail.setPath(path);
-    else svTrail = new google.maps.Polyline({ path, map, zIndex: 45, clickable: false, geodesic: true,
-                                              strokeColor: SURVEYC, strokeOpacity: 0.8, strokeWeight: 2 });
+    else svTrail = new google.maps.Polyline({ path, map, zIndex: 45, clickable: false, geodesic: true, strokeOpacity: 0,
+      /* dashed, so it reads as the route walked rather than as a link */
+      icons: [{ icon: { path: 'M 0,-1 0,1', strokeColor: SURVEYC, strokeOpacity: 0.9, scale: 2 }, offset: '0', repeat: '10px' }] });
   } else if (svTrail) { svTrail.setMap(null); svTrail = null; }
   surveyInfo();
 }
 
 /* The same panel as a node's, with the question turned round: not "what could this reach" but
-   "what did it actually hear here" -- each station, strongest first, with how far away it is. */
+   "what did it actually hear here" -- each station, strongest first, with how far away it is, and
+   what the model predicts for that path. The point is modelled as a receptivity field's far end
+   would be: the terrain under it, targetAgl above that, the site's receiving antenna. */
 function surveyHover(i) {
   const r = SV.reports[i];
   if (!r) return unpin();
@@ -798,20 +849,33 @@ function surveyHover(i) {
   $('hover').classList.toggle('pinned', live);
   $('hfield').style.display = 'none';            /* a receptivity field means nothing for a stand */
   $('hdot').style.background = SURVEYC;
-  $('hname').textContent = `survey #${i + 1}  ${r.observer}  ${r.at ? new Date(r.at).toLocaleTimeString() : ''}`;
+  const prev = surveyNext(i, -1), next = surveyNext(i, 1);
+  $('hname').innerHTML = `survey #${i + 1} <span class="svnav">(<a id="svprev"${prev < 0 ? ' class="off"' : ''} title="previous point (&larr;)">&lsaquo;</a>`
+    + `<a id="svnext"${next < 0 ? ' class="off"' : ''} title="next point (&rarr;)">&rsaquo;</a>)</span> ${esc(r.observer)} ${r.at ? new Date(r.at).toLocaleTimeString() : ''}`;
+  if (prev >= 0) $('svprev').onclick = () => surveyGo(prev);
+  if (next >= 0) $('svnext').onclick = () => surveyGo(next);
   const sph = google.maps.geometry.spherical, a = new google.maps.LatLng(r.lat, r.lng);
+  const me = { lat: r.lat, lng: r.lng, elev: r.elev ?? null, agl: Number(S.targetAgl) || 1 };
   const rows = Object.entries(r.heard).map(([id, h]) => {
     const at = stationAt(id), b = at ? new google.maps.LatLng(at.lat, at.lng) : null;
-    return { id, name: at ? at.name : (SV.stations[id] || ''), rssi: h.rssi,
+    const info = at && me.elev != null && at.elev != null ? linkInfo(me, at) : null;
+    const A = info && info.A;
+    return { id, name: at ? at.name : (SV.stations[id] || ''), rssi: h.rssi, A,
+             model: A ? sysGainOut(at) - A.loss : null,
+             wait: !!at && (r.elev === undefined || (!!info && !A && info.d >= 1)),
              d: b ? sph.computeDistanceBetween(a, b) : null, brg: b ? (sph.computeHeading(a, b) + 360) % 360 : null };
   }).sort((x, y) => (y.rssi ?? -999) - (x.rssi ?? -999));
-  let h = '<table><tr><th>heard</th><th>dist</th><th>brg</th><th>rssi</th></tr>';
-  for (const x of rows)
+  let h = '<table><tr><th>heard</th><th>dist</th><th>brg</th><th>rssi</th><th>model</th></tr>';
+  for (const x of rows) {
+    const tip = !x.A ? '' : `free space ${dB(x.A.fspl)} + terrain ${dB(x.A.diffLoss)} + foliage ${dB(x.A.vegLoss)}`
+      + (x.rssi != null ? `; heard ${Math.abs(Math.round(x.rssi - x.model))} dB ${x.rssi >= x.model ? 'above' : 'below'} it` : '');
     h += `<tr><td>${esc(x.id)} ${esc(x.name)}</td><td>${x.d != null ? m2s(x.d) : '&mdash;'}</td>`
        + `<td>${x.brg != null ? x.brg.toFixed(0) + '&deg;' : '&mdash;'}</td>`
-       + `<td class="${rssiCls(x.rssi)}">${x.rssi != null ? x.rssi + ' dBm' : '&mdash;'}</td></tr>`;
+       + `<td class="${rssiCls(x.rssi)}">${x.rssi != null ? x.rssi + ' dBm' : '&mdash;'}</td>`
+       + `<td class="${rssiCls(x.model)}" title="${esc(tip)}">${x.model != null ? Math.round(x.model) + ' dBm' : x.wait ? '&hellip;' : '&mdash;'}</td></tr>`;
+  }
   h += '</table><div class="probeline"><span>' + r.lat.toFixed(6) + ', ' + r.lng.toFixed(6) + '</span><span>'
-     + (r.alt != null ? r.alt + 'm · ' : '') + rows.length + ' heard</span></div>';
+     + (r.alt != null ? r.alt + 'm · ' : '') + rows.length + ' heard · model @' + me.agl + 'm agl</span></div>';
   if (rows.some((x) => x.d == null))
     h += '<div class="hint">No distance: that station is not placed on this map, or its name does not match one here (give the layout entry a <code>station</code> id).</div>';
   $('hbody').innerHTML = h;
