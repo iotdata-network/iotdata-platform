@@ -49,7 +49,6 @@
 #include "d_common.h"
 #include "d_format.h"
 #include "d_module_version_esp32.h"
-#include "d_console_esp32.h"
 #include "d_module_datastore_esp32.h"
 #include "d_module_filestore_esp32.h"
 #include "d_module_otaslot_esp32.h"
@@ -78,6 +77,7 @@
 #endif
 #include "d_hardware_adc.h"
 #include "d_interface_batt.h"
+#include "d_console_esp32.h"
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // PROTOCOL
@@ -165,9 +165,6 @@ static iotdata_node_content_t _iapp_content;
 
 static iotdata_node_control_result_t _iapp_node_control(__attribute__((unused)) const uint16_t station, const uint8_t subject, const uint8_t action, const uint8_t *const val, const uint8_t vlen, const char **const reason) {
     switch (subject) {
-    /* The recorder's own API answers the narrower "was it mine?", and has no refusal to express;
-       content's answers all three, so a store that is not mounted or an update switched off comes
-       back REFUSED with its condition rather than counted as a serviced command. */
     case IOTDATA_NODE_TLV_DIAGNOSTICS:
         return iotdata_node_control_result_of(iotdata_node_diagnostics_control(subject, action, val, vlen));
     case IOTDATA_NODE_TLV_CONTENT:
@@ -215,23 +212,25 @@ typedef struct {
 } iapp_running_t;
 
 static _RTC_DATA_STRUCT iapp_operating_t _iapp_operating;
-static iapp_running_t _iapp_running = { .node_config = {
-                                            .caps = &_iapp_operating.caps,
-                                            .status = _iapp_node_status,
-                                            .tx = _iapp_node_transmit,
-                                            .control = _iapp_node_control,
-                                            .control_actions = _iapp_control_actions,
-                                            .control_actions_count = IAPP_CONTROL_ACTIONS_COUNT,
-                                            .diag = IOTDATA_NODE_DIAGNOSTICS_PULL,
-                                            .receive_every_s = IOTDATA_NODE_RECEIVE_EVERY_S,
-                                            .receive_window_s = IOTDATA_NODE_RECEIVE_WINDOW_S,
-                                            .settings = &_iapp_running.node_settings,
-                                            .state = &_iapp_running.node,
-                                            .config_build = _iapp_node_config_build,
-                                            .config_build_written = _iapp_node_config_build_written,
-                                            .config_apply = _iapp_node_config_apply,
-                                            .packet_max = LORA_PACKET_SIZE_MAX,
-                                        } };
+static iapp_running_t _iapp_running = { 
+    .node_config = {
+        .caps = &_iapp_operating.caps,
+        .status = _iapp_node_status,
+        .tx = _iapp_node_transmit,
+        .control = _iapp_node_control,
+        .control_actions = _iapp_control_actions,
+        .control_actions_count = IAPP_CONTROL_ACTIONS_COUNT,
+        .diag = IOTDATA_NODE_DIAGNOSTICS_PULL,
+        .receive_every_s = IOTDATA_NODE_RECEIVE_EVERY_S,
+        .receive_window_s = IOTDATA_NODE_RECEIVE_WINDOW_S,
+        .settings = &_iapp_running.node_settings,
+        .state = &_iapp_running.node,
+        .config_build = _iapp_node_config_build,
+        .config_build_written = _iapp_node_config_build_written,
+        .config_apply = _iapp_node_config_apply,
+        .packet_max = LORA_PACKET_SIZE_MAX,
+    }, 
+};
 
 typedef struct {
     iapp_operating_t *const operating;
@@ -347,12 +346,10 @@ static void iapp_cycle_elapsed(iapp_state_t *const as, const uint32_t cycle_ms) 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
 static uint32_t iapp_sleep_remaining(iapp_state_t *const as, const uint32_t start_ms, const uint32_t period_ms) {
-
     if (period_ms == 0)
         return 0;
     if (as->running->cycle_due_ms == 0)
         as->running->cycle_due_ms = start_ms; /* first cycle anchors the grid where it woke */
-
     as->running->cycle_due_ms += period_ms;
     int32_t remain = (int32_t)(as->running->cycle_due_ms - hw_time_ms());
     while (remain <= 0) { /* overran: give up this slot, keep the phase */
