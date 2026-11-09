@@ -45,10 +45,15 @@
 #include "d_module_filestore.h" /* the seam: content.h is written against it */
 #include "iotdata_node_content.h"
 #include "d_module_filestore_ram.h"
+#include "iotdata_node_content_manifest.h" /* the offers half: content_control.h speaks it too */
 #include "d_module_otaslot.h"
 #include "iotdata_node_content_ota.h"
 #include "iotdata_node_content_control.h"
 #include "iotdata_node_console_content.h"
+
+/* Every id in this suite is 0x053xxx, so this node is station 0x053 -- §4 puts the originating
+   station in an id's top twelve bits, and the offers table holds both sides of that rule. */
+#define MY_STATION 0x053u
 
 static int fails = 0;
 #define CHECK(c, m) \
@@ -115,12 +120,40 @@ static filestore_ram_t fs;
 static iotdata_node_content_t store;
 static uint32_t clock_ms = 1000u;
 
+/* The offers table, and a stand-in for the application's down path: an advertisement has to reach a
+   radio, and what the handler can be held to is that it tried, with the right audience and the
+   right bytes. */
+static iotdata_node_content_manifests_t offers;
+typedef struct {
+    int calls;
+    uint16_t audience;
+    uint8_t val[128];
+    size_t len;
+    bool fail;
+} aired_t;
+static aired_t aired;
+
+static bool aired_cb(__attribute__((unused)) void *ctx, const uint16_t audience, const uint8_t *const tlv, const size_t len) {
+    aired.calls++;
+    aired.audience = audience;
+    aired.len = (len < sizeof(aired.val)) ? len : sizeof(aired.val);
+    memcpy(aired.val, tlv, aired.len);
+    return !aired.fail;
+}
+
+static void rig_offers(const bool can_originate) {
+    iotdata_node_content_manifests_init(&offers, true, MY_STATION);
+    iotdata_node_content_control_offers_init(&offers, can_originate ? aired_cb : NULL, NULL);
+    aired = (aired_t){ 0 };
+}
+
 static void rig(void) {
     const d_filestore_t *const be = filestore_ram_init(&fs);
     iotdata_node_content_init(&store, be);
     (void)iotdata_node_content_begin(&store, clock_ms); /* the tick does nothing until it has */
     iotdata_node_console_content_init(&store);
     iotdata_node_content_control_init(&store, NULL);
+    rig_offers(true);
     (void)iotdata_node_content_emit_set(say);
     iotdata_node_console_sink_clear();
     said_reset();
@@ -613,7 +646,7 @@ static void test_control_words(void) {
     CHECK(filestore_ram_plant(&fs, 0x0537f2u, b, sizeof(b)), "planted");
 
     said_reset();
-    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_LIST, NULL, 0u, NULL), "list is ours");
+    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_LIST, NULL, 0u, 1000u, NULL), "list is ours");
     CHECK(said_has("0537f1"), "and lists the first");
     CHECK(said_has("0537f2"), "and the second");
     CHECK(said_has("2 files"), "and counts them last");
@@ -622,20 +655,20 @@ static void test_control_words(void) {
        only check that the two layers agree about the width of a content id. */
     said_reset();
     const uint8_t id_f1[3] = { 0x05u, 0x37u, 0xf1u };
-    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_VALIDATE, id_f1, 3u, NULL), "validate is ours");
+    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_VALIDATE, id_f1, 3u, 1000u, NULL), "validate is ours");
     char want[80];
     snprintf(want, sizeof(want), "crc64=0x%016llX", (unsigned long long)_iotdata_crc64(a, sizeof(a), _IOTDATA_CRC64_INIT));
     CHECK(said_has(want), "and reports the store's own sum");
     CHECK(!said_has("INCOMPLETE"), "over a whole file");
 
     said_reset();
-    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_DELETE, id_f1, 3u, NULL), "delete is ours");
+    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_DELETE, id_f1, 3u, 1000u, NULL), "delete is ours");
     CHECK(said_has("deleted"), "and says so");
     uint32_t total = 0u, held = 0u;
     CHECK(!iotdata_node_content_stat(&store, 0x0537f1u, &total, &held), "and it is gone");
 
     said_reset();
-    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_DELETE, id_f1, 3u, NULL), "a second delete is still ours");
+    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_DELETE, id_f1, 3u, 1000u, NULL), "a second delete is still ours");
     CHECK(!said_has("deleted"), "but deletes nothing");
     /* And says WHY in the words an operator needs: a well-formed id with nothing under it is not
        the same complaint as an id that could never name anything. */
@@ -646,12 +679,174 @@ static void test_control_words(void) {
        "claimed" and assume it ran. The reason comes back with it, because the operator who typed
        the command is the only one who can act on it. */
     const char *why = NULL;
-    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_DELETE, NULL, 0u, &why) == IOTDATA_NODE_CONTROL_RESULT_REFUSED, "an id-less command is OURS and refused");
+    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_DELETE, NULL, 0u, 1000u, &why) == IOTDATA_NODE_CONTROL_RESULT_REFUSED, "an id-less command is OURS and refused");
     CHECK(said_has("no id"), "and says which");
     CHECK(why != NULL && strcmp(why, "no id given") == 0, "to the seam as well as to the console");
-    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_LIST, NULL, 0u, NULL) == IOTDATA_NODE_CONTROL_RESULT_DONE, "a command that ran is DONE, not merely claimed");
-    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, 0x7Fu, NULL, 0u, NULL) == IOTDATA_NODE_CONTROL_RESULT_UNKNOWN, "an action we do not have is not ours");
-    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_STATUS, IOTDATA_NODE_ACTION_CONTENT_LIST, NULL, 0u, NULL) == IOTDATA_NODE_CONTROL_RESULT_UNKNOWN, "nor another subject's");
+    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_LIST, NULL, 0u, 1000u, NULL) == IOTDATA_NODE_CONTROL_RESULT_DONE, "a command that ran is DONE, not merely claimed");
+    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, 0x7Fu, NULL, 0u, 1000u, NULL) == IOTDATA_NODE_CONTROL_RESULT_UNKNOWN, "an action we do not have is not ours");
+    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_STATUS, IOTDATA_NODE_ACTION_CONTENT_LIST, NULL, 0u, 1000u, NULL) == IOTDATA_NODE_CONTROL_RESULT_UNKNOWN, "nor another subject's");
+}
+
+/* ------------------------------------------------------------------------------------------- */
+
+/* THE OFFERS HALF, through the same handler a radio reaches. What the words have to get right is
+   not the table -- that has its own suite -- but the four things only this layer does: reading the
+   arguments the control vocabulary packed, taking the size and the hash off the STORE rather than
+   from the request, refusing honestly what this build cannot do, and putting the right bytes in
+   front of the application's down path. */
+static void test_offer_words(void) {
+    printf("\nauthoring, listing, advertising and revoking an offer, through the handler\n");
+    rig();
+    uint8_t a[448];
+    fill(a, sizeof(a), 3u);
+    CHECK(filestore_ram_plant(&fs, 0x0537a1u, a, sizeof(a)), "a file is held");
+    const uint64_t crc = _iotdata_crc64(a, sizeof(a), _IOTDATA_CRC64_INIT);
+
+    /* { u24 id, u8 encoding, u16 expiry-m, u24 sig-id, name NUL } -- exactly what
+       iotdata_node_control_build writes for ARG_MANIFEST, which is the only check that the two
+       layers agree about the shape. */
+    const uint8_t set[] = { 0x05u, 0x37u, 0xa1u, 0x00u, 0x05u, 0xA0u, 0x05u, 0x37u, 0xa2u, 'i', 'm', 'g', '\0' };
+    said_reset();
+    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_MANIFEST_SET, set, (uint8_t)sizeof(set), 1000u, NULL) == IOTDATA_NODE_CONTROL_RESULT_DONE, "the manifest is authored");
+    const iotdata_node_content_manifest_t *m = iotdata_node_content_manifest_find(&offers, 0x0537a1u);
+    CHECK(m != NULL, "and the table has it");
+    if (m != NULL) {
+        CHECK(m->size == sizeof(a) && m->hash == crc, "with the size and the hash READ OFF THE STORE, not taken from the request");
+        CHECK(m->expiry_m == 1440u && m->sig_id == 0x0537a2u, "and the fields that were");
+        CHECK(strcmp(m->name, "img") == 0, "the name included");
+        CHECK(m->local, "it is ours, so we may advertise it");
+    }
+    /* THE REPLY STATES WHAT WAS WRITTEN DOWN, which is the only chance an operator has to see that
+       the file they think they uploaded is the file the node summed. */
+    CHECK(said_has("448 bytes"), "the reply says the size it found");
+    CHECK(said_has("14 chunks"), "what that is in chunks");
+    CHECK(said_has("img"), "and the name");
+
+    said_reset();
+    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_MANIFEST_LIST, NULL, 0u, 1000u, NULL) == IOTDATA_NODE_CONTROL_RESULT_DONE, "the offers list");
+    CHECK(said_has("0537A1"), "naming the id");
+    CHECK(said_has("1 offer of"), "and how many of the table is in use");
+
+    /* ADVERTISING: the audience is the second field, and the bytes handed to the down path have to
+       be a MANIFEST TLV for that id -- which is checked by parsing them back. */
+    said_reset();
+    const uint8_t adv[] = { 0x05u, 0x37u, 0xa1u, 0x05u, 0x7Du };
+    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_ADVERTISE, adv, (uint8_t)sizeof(adv), 1000u, NULL) == IOTDATA_NODE_CONTROL_RESULT_DONE, "it is advertised");
+    CHECK(aired.calls == 1, "once");
+    CHECK(aired.audience == 0x057Du, "to the station the request named");
+    iotdata_content_manifest_t w;
+    CHECK(iotdata_content_manifest_parse(aired.val, aired.len, &w), "and what went out is a MANIFEST");
+    CHECK(w.id == 0x0537a1u && w.size == sizeof(a) && w.hash == crc, "for that content, as described");
+    CHECK(w.generation == 1u, "with the first origination spent on it");
+
+    /* AND COMING ROUND AGAIN AT ONCE IS REFUSED, which is the floor under re-origination: four
+       bits of generation exhaust in sixteen, so a loop would burn them in under a minute. */
+    said_reset();
+    const char *why = NULL;
+    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_ADVERTISE, adv, (uint8_t)sizeof(adv), 1000u, &why) == IOTDATA_NODE_CONTROL_RESULT_REFUSED, "a second origination at once is refused");
+    CHECK(aired.calls == 1, "and nothing more went on the air");
+    CHECK(said_has("too recently"), "and the reason is the floor, not the two rules it is not");
+    CHECK(why != NULL && strstr(why, "four bits") != NULL, "to the seam as well");
+
+    /* A SECOND ORIGINATION A FLOOR LATER DIFFERS, because a byte-identical refresh is thrown by
+       every relay that still remembers the last one -- which would silence the one message whose
+       job is to keep arriving. */
+    const uint32_t spaced_ms = 1000u + (uint32_t)IOTDATA_NODE_CONTENT_READVERTISE_MIN_S * 1000u + 1000u;
+    uint8_t first[128];
+    const size_t first_len = aired.len;
+    memcpy(first, aired.val, first_len);
+    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_ADVERTISE, adv, (uint8_t)sizeof(adv), spaced_ms, NULL) == IOTDATA_NODE_CONTROL_RESULT_DONE, "advertised again");
+    CHECK(aired.len == first_len && memcmp(aired.val, first, first_len) != 0, "same size, different bytes");
+
+    /* A TRANSMIT THAT FAILS IS REFUSED RATHER THAN CLAIMED, so the operator knows nothing went. */
+    said_reset();
+    aired.fail = true;
+    const uint32_t spaced2_ms = spaced_ms + (uint32_t)IOTDATA_NODE_CONTENT_READVERTISE_MIN_S * 1000u + 1000u;
+    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_ADVERTISE, adv, (uint8_t)sizeof(adv), spaced2_ms, &why) == IOTDATA_NODE_CONTROL_RESULT_REFUSED, "a failed send is refused");
+    CHECK(why != NULL && strstr(why, "could not be sent") != NULL, "and says why");
+    aired.fail = false;
+
+    /* REVOKING: the fleet is told FIRST and the bytes destroyed after, which is the order that
+       cannot leave a holder serving what this node has already thrown away. */
+    said_reset();
+    const uint8_t id_a1[3] = { 0x05u, 0x37u, 0xa1u };
+    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_REVOKE, id_a1, 3u, 1000u, NULL) == IOTDATA_NODE_CONTROL_RESULT_DONE, "it is revoked");
+    CHECK(iotdata_content_manifest_parse(aired.val, aired.len, &w) && w.expiry_m == IOTDATA_CONTENT_EXPIRY_REVOKED, "the frame that went out is a zero expiry");
+    CHECK(w.id == 0x0537a1u, "for that id");
+    uint32_t total = 0u, held = 0u;
+    CHECK(!iotdata_node_content_stat(&store, 0x0537a1u, &total, &held), "and the bytes are gone");
+    CHECK(iotdata_node_content_manifest_find(&offers, 0x0537a1u) == NULL, "with the offer");
+    CHECK(said_has("announced"), "and the reply says the fleet was told");
+}
+
+static void test_offer_words_refuse_honestly(void) {
+    printf("\nand what they refuse: an absent file, a cache's offer, and a build that cannot originate\n");
+    rig();
+
+    /* A MANIFEST FOR SOMETHING WE DO NOT HOLD. The size and the hash come off the store, so there
+       is nothing to describe and nothing is invented. */
+    const uint8_t set[] = { 0x05u, 0x37u, 0xb9u, 0x00u, 0xFFu, 0xFFu, 0x00u, 0x00u, 0x00u, '\0' };
+    said_reset();
+    const char *why = NULL;
+    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_MANIFEST_SET, set, (uint8_t)sizeof(set), 1000u, &why) == IOTDATA_NODE_CONTROL_RESULT_REFUSED, "refused");
+    CHECK(said_has("no such content id"), "naming what the store said");
+    CHECK(iotdata_node_content_manifests_count(&offers) == 0u, "and no row is left behind");
+
+    /* TOO SHORT TO BE A MANIFEST. Nine bytes is the fixed part with no terminator for the name,
+       and there is no length field to consult for a second opinion. */
+    said_reset();
+    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_MANIFEST_SET, set, 9u, 1000u, &why) == IOTDATA_NODE_CONTROL_RESULT_REFUSED, "a truncated argument is refused");
+    CHECK(why != NULL && strstr(why, "malformed") != NULL, "as malformed");
+
+    /* AN OFFER WE ONLY HEARD MUST NOT BE RE-ORIGINATED, which is a rule and not a fault: the
+       expiry is not decremented when forwarded, so a cache re-stating one would extend its life
+       indefinitely. */
+    uint8_t frame[64];
+    const iotdata_content_manifest_t heard = { .id = 0x0601a1u, .size = 64u, .hash = 5u, .sig_id = 0x0601a2u, .expiry_m = 600u, .name = "somebody else's" };
+    const size_t n = iotdata_content_manifest_pack(frame, sizeof(frame), &heard);
+    CHECK(iotdata_node_content_manifest_on_wire(&offers, &store, frame, n, 1000u, NULL) == IOTDATA_NODE_CONTENT_OK, "we know of it");
+    said_reset();
+    const uint8_t adv_heard[] = { 0x06u, 0x01u, 0xa1u, 0x0Fu, 0xFFu };
+    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_ADVERTISE, adv_heard, (uint8_t)sizeof(adv_heard), 1000u, &why) == IOTDATA_NODE_CONTROL_RESULT_REFUSED, "and must not re-originate it");
+    CHECK(aired.calls == 0, "nothing went on the air");
+    CHECK(said_has("not ours to originate"), "and the reason says which of the three it is");
+    CHECK(why != NULL && strstr(why, "not ours") != NULL, "to the seam too");
+
+    /* A BUILD THAT CANNOT ORIGINATE -- which is every relay and every sensor today -- says so
+       rather than going quiet, so the verb is not "unknown" on some nodes and real on others. */
+    rig_offers(false);
+    said_reset();
+    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_ADVERTISE, adv_heard, (uint8_t)sizeof(adv_heard), 1000u, &why) == IOTDATA_NODE_CONTROL_RESULT_REFUSED, "refused, not unknown");
+    CHECK(said_has("cannot originate"), "and says what this build is");
+    /* ... but it can still be TOLD, and still answer what it knows. */
+    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_MANIFEST_LIST, NULL, 0u, 1000u, NULL) == IOTDATA_NODE_CONTROL_RESULT_DONE, "listing still works");
+
+    /* AND A BUILD WITH NO OFFERS TABLE AT ALL. Same honesty, one layer further out. */
+    iotdata_node_content_control_offers_init(NULL, NULL, NULL);
+    said_reset();
+    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_MANIFEST_LIST, NULL, 0u, 1000u, &why) == IOTDATA_NODE_CONTROL_RESULT_REFUSED, "no table is refused");
+    CHECK(said_has("tracks none"), "and says so");
+    rig_offers(true);
+    /* AND THE FOURTH REASON, which destroys the evidence for itself: advertise() DROPS an offer
+       whose bytes have been replaced, so by the time the handler looks for a row to explain the
+       refusal there is none -- and "no offer of ours for that id" is exactly the wrong thing to
+       tell somebody whose id was right. */
+    {
+        rig();
+        static uint8_t one[448], two[448];
+        for (size_t i = 0; i < sizeof(one); i++) {
+            one[i] = (uint8_t)(0x10u + i);
+            two[i] = (uint8_t)(0x99u + i); /* same length, different object: what a size check misses */
+        }
+        CHECK(filestore_ram_plant(&fs, 0x0537a1u, one, sizeof(one)), "a file");
+        CHECK(iotdata_node_content_manifest_author(&offers, &store, 0x0537a1u, "img", 0u, 600u, 0x0537a2u, 1000u) == IOTDATA_NODE_CONTENT_OK, "an offer of ours");
+        CHECK(filestore_ram_plant(&fs, 0x0537a1u, two, sizeof(two)), "and a different build dropped in under the same id");
+        const uint8_t adv[] = { 0x05u, 0x37u, 0xa1u, 0x0Fu, 0xFFu }; /* id then audience: broadcast */
+        said_reset();
+        CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_ADVERTISE, adv, (uint8_t)sizeof(adv), 1000u, &why) == IOTDATA_NODE_CONTROL_RESULT_REFUSED, "advertising it is refused");
+        CHECK(said_has("replaced"), "saying the bytes under it were replaced");
+        CHECK(!said_has("no offer of ours"), "and NOT that the id was unknown, which is what it used to say");
+    }
 }
 
 /* ------------------------------------------------------------------------------------------- */
@@ -703,7 +898,7 @@ static void test_inspect_ota(void) {
     const uint32_t head = faux(0x053801u, "relay", 0x40000u, 64u, 64u);
     CHECK(head > 0u, "a bundle this build could take");
     said_reset();
-    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_INSPECT, id_ok, 3u, NULL), "inspect is ours");
+    CHECK(iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_INSPECT, id_ok, 3u, 1000u, NULL), "inspect is ours");
     CHECK(said_has("app=relay semver=1.2.3 stamp=202610111200"), "the identity");
     CHECK(said_has("form=full codec=none"), "the shape");
     CHECK(said_has("payload=64"), "and what the payload should weigh");
@@ -712,7 +907,7 @@ static void test_inspect_ota(void) {
 
     (void)faux(0x053802u, "gateway", 0x40000u, 64u, 64u);
     said_reset();
-    (void)iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_INSPECT, id_app, 3u, NULL);
+    (void)iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_INSPECT, id_app, 3u, 1000u, NULL);
     CHECK(said_has("app=gateway"), "a bundle for something else parses");
     CHECK(said_has("ota check: different application"), "and is refused for the right reason");
 
@@ -720,7 +915,7 @@ static void test_inspect_ota(void) {
        Nothing in the header is wrong -- it is the FILE that is short, and only the store knows. */
     (void)faux(0x053803u, "relay", 0x40000u, 64u, 32u);
     said_reset();
-    (void)iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_INSPECT, id_short, 3u, NULL);
+    (void)iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_INSPECT, id_short, 3u, 1000u, NULL);
     CHECK(said_has("ota check: not equal to the header length"), "a short file is caught here, not at the far end of a decode");
 
     /* Most content is not firmware, and inspect says nothing about OTA for it rather than
@@ -729,7 +924,7 @@ static void test_inspect_ota(void) {
     fill(plain, sizeof(plain), 61u);
     CHECK(filestore_ram_plant(&fs, 0x053804u, plain, sizeof(plain)), "an ordinary file");
     said_reset();
-    (void)iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_INSPECT, id_plain, 3u, NULL);
+    (void)iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_INSPECT, id_plain, 3u, 1000u, NULL);
     CHECK(said_has("053804 200 of 200 bytes"), "is described");
     CHECK(!said_has("ota"), "and is not accused of being a bundle");
 
@@ -737,7 +932,7 @@ static void test_inspect_ota(void) {
        the useful answer. */
     CHECK(filestore_ram_plant(&fs, 0x053805u, IOTDATA_NODE_OTA_MAGIC, (uint32_t)IOTDATA_NODE_OTA_MAGIC_LEN), "a bundle that is only its magic");
     said_reset();
-    (void)iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_INSPECT, id_trunc, 3u, NULL);
+    (void)iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_INSPECT, id_trunc, 3u, 1000u, NULL);
     CHECK(said_has("ota header:"), "says the header is the problem");
     CHECK(!said_has("ota check:"), "and does not go on to judge what it could not read");
 
@@ -745,7 +940,7 @@ static void test_inspect_ota(void) {
        judging against zeroes and calling a good bundle unacceptable. */
     iotdata_node_content_control_init(&store, NULL);
     said_reset();
-    (void)iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_INSPECT, id_ok, 3u, NULL);
+    (void)iotdata_node_content_control(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_INSPECT, id_ok, 3u, 1000u, NULL);
     CHECK(said_has("app=relay"), "still parses");
     CHECK(said_has("not judged"), "and says why it will not say");
 }
@@ -800,6 +995,8 @@ int main(void) {
     test_download();
     test_download_refusals();
     test_control_words();
+    test_offer_words();
+    test_offer_words_refuse_honestly();
     test_inspect_ota();
     test_control_argv_agrees();
     if (fails > 0) {

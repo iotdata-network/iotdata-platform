@@ -265,6 +265,83 @@ static void test_walk(void) {
 
 /* ------------------------------------------------------------------------------------------- */
 
+/* THE SIDECAR, against a real filesystem. What the RAM model cannot test is the part that is
+   actually filesystem behaviour: that a `.m` file is invisible to the walk, that a half-written one
+   can never be read back, and that create() and destroy() both take it with them. */
+static void test_the_sidecar(void) {
+    printf("\na description beside the bytes: invisible to the walk, and never outliving them\n");
+    filestore_linux_t fs;
+    const d_filestore_t *const be = rig(&fs, 0u);
+    uint8_t data[64];
+    fill(data, sizeof(data), 9u);
+    CHECK(plant(be, 0x0537d1u, data, sizeof(data)), "a file");
+    CHECK(be->meta_write != NULL && be->meta_read != NULL, "the store keeps sidecars");
+
+    uint8_t side[16] = { 'd', 'e', 's', 'c', 0 };
+    CHECK(be->meta_write(be->ctx, 0x0537d1u, side, 5u) == 5, "a description is written");
+    uint8_t back[D_FILESTORE_META_MAX];
+    CHECK(be->meta_read(be->ctx, 0x0537d1u, back, sizeof(back)) == 5, "and read back whole");
+    CHECK(memcmp(back, side, 5u) == 0, "byte for byte");
+    /* NO SIDECAR IS NOT AN ERROR: most content has none, and a reader must be able to tell that
+       from a store that is broken. */
+    CHECK(be->meta_read(be->ctx, 0x0537d2u, back, sizeof(back)) == 0, "an id with none reads as none");
+
+    /* INVISIBLE TO THE WALK, for nothing: the id recogniser admits a name only if it is exactly
+       six hex digits, so `0537d1.m` was already not content. This is the property the whole choice
+       of filename rests on, so it is pinned rather than assumed. */
+    uint32_t cursor = 0u, id = 0u, seen = 0u;
+    while (be->iterate(be->ctx, &cursor, &id)) {
+        seen++;
+        CHECK(id == 0x0537d1u, "the walk sees the content and not its description");
+    }
+    CHECK(seen == 1u, "one file, not two");
+
+    /* AND SO IS THE TEMPORARY IT IS WRITTEN THROUGH, which is what stops a half-written sidecar
+       from ever being read: `.m.t` is not six hex digits either. */
+    char path[256];
+    (void)snprintf(path, sizeof(path), "%s/0537d1.m.t", g_dir);
+    FILE *const t = fopen(path, "wb");
+    CHECK(t != NULL, "a stray temporary");
+    if (t != NULL) {
+        (void)fputs("half", t);
+        (void)fclose(t);
+    }
+    cursor = 0u;
+    seen = 0u;
+    while (be->iterate(be->ctx, &cursor, &id))
+        seen++;
+    CHECK(seen == 1u, "is not content either");
+    CHECK(be->meta_read(be->ctx, 0x0537d1u, back, sizeof(back)) == 5, "and the real one still reads");
+
+    /* LONGER THAN A SIDECAR MAY BE is refused rather than truncated: a description cut in half
+       would parse as a different description. */
+    uint8_t big[D_FILESTORE_META_MAX + 8];
+    memset(big, 0xAB, sizeof(big));
+    CHECK(be->meta_write(be->ctx, 0x0537d1u, big, sizeof(big)) < 0, "an oversized description is refused");
+    CHECK(be->meta_read(be->ctx, 0x0537d1u, back, sizeof(back)) == 5, "leaving the one that was there");
+
+    /* ZERO LENGTH WITHDRAWS IT, without touching the bytes. */
+    CHECK(be->meta_write(be->ctx, 0x0537d1u, NULL, 0u) == 0, "a zero-length write removes it");
+    CHECK(be->meta_read(be->ctx, 0x0537d1u, back, sizeof(back)) == 0, "and it is gone");
+    uint32_t total = 0u, held = 0u;
+    CHECK(be->stat(be->ctx, 0x0537d1u, &total, &held) && held == sizeof(data), "the content is untouched");
+
+    /* DESTROY TAKES IT, or the next id to reuse that number inherits somebody else's description. */
+    CHECK(be->meta_write(be->ctx, 0x0537d1u, side, 5u) == 5, "described again");
+    be->destroy(be->ctx, 0x0537d1u);
+    CHECK(be->meta_read(be->ctx, 0x0537d1u, back, sizeof(back)) == 0, "and destroying the file takes it");
+    CHECK(plant(be, 0x0537d1u, data, sizeof(data)), "so a reused id");
+    CHECK(be->meta_read(be->ctx, 0x0537d1u, back, sizeof(back)) == 0, "starts undescribed");
+
+    /* AND SO DOES CREATE, because a new object under an old id is a different object -- the size
+       and the hash can be re-derived from the new bytes, the NAME cannot. */
+    CHECK(be->meta_write(be->ctx, 0x0537d1u, side, 5u) == 5, "described");
+    CHECK(be->create(be->ctx, 0x0537d1u, 32u), "and then written over");
+    CHECK(be->meta_read(be->ctx, 0x0537d1u, back, sizeof(back)) == 0, "the description went with the old bytes");
+
+    filestore_linux_close(&fs);
+}
+
 static void test_budget(void) {
     printf("\nthe budget is the edge a directory does not otherwise have\n");
     filestore_linux_t fs;
@@ -453,6 +530,7 @@ int main(void) {
     test_append_only();
     test_rename_is_atomic();
     test_walk();
+    test_the_sidecar();
     test_budget();
     test_survives_reopen();
     test_agrees_with_the_model();

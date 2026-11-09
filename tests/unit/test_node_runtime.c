@@ -49,6 +49,30 @@ static bool tx_cb(const uint8_t *p, size_t n) {
     (void)n;
     return true;
 }
+/* A TABLE AN END DEVICE KEEPS. Scripted rather than real: what is under test is that the shared
+   builder asks, pages and packs -- the content module's own rows have their own suite. */
+static uint8_t tbl_rows = 0;
+static uint8_t tbl_count_cb(const uint8_t entry) {
+    return (entry == IOTDATA_NODE_STATUS_CONTENT_ENTRY) ? tbl_rows : 0u;
+}
+static bool tbl_row_cb(const uint8_t entry, const uint8_t index, uint8_t *const row) {
+    if (entry != IOTDATA_NODE_STATUS_CONTENT_ENTRY || index >= tbl_rows)
+        return false;
+    iotdata_node_entry_put_u24(row, 0, 0x001000u + index); /* the id is enough to tell rows apart */
+    return true;
+}
+
+/* How many entries of `key` a report carries. */
+static int count_key(const uint8_t *const kv, const uint8_t len, const uint8_t key) {
+    size_t cur = 0;
+    uint8_t k, vlen;
+    const uint8_t *val;
+    int n = 0;
+    while (iotdata_kvr_next(kv, len, &cur, &k, &val, &vlen))
+        if (k == key)
+            n++;
+    return n;
+}
 /* a node that senses AND relays fills the mesh group in the same struct: no second callback */
 static void both_cb(uint16_t s, iotdata_node_status_t *o) {
     st_cb(s, o);
@@ -57,10 +81,12 @@ static void both_cb(uint16_t s, iotdata_node_status_t *o) {
     o->mesh.cost = 3;
 }
 static uint8_t seen_key = 0;
-static iotdata_node_control_result_t ctl_cb(uint16_t s, uint8_t subject, uint8_t action, const uint8_t *v, uint8_t n, const char **reason) {
+static uint32_t seen_now_ms = 0xFFFFFFFFu;
+static iotdata_node_control_result_t ctl_cb(uint16_t s, uint8_t subject, uint8_t action, const uint8_t *v, uint8_t n, uint32_t now_ms, const char **reason) {
     (void)s;
     (void)v;
     (void)n;
+    seen_now_ms = now_ms; /* recorded unconditionally: what a handler is handed is the point */
     if (subject != IOTDATA_NODE_SUBJECT_MESH)
         return IOTDATA_NODE_CONTROL_RESULT_UNKNOWN;
     if (action == IOTDATA_NODE_ACTION_MESH_PEERS_CLEAR) {
@@ -124,6 +150,54 @@ int main(void) {
     CHECK(len > 0 && count_group(buf, (uint8_t)len, 0) == 0 && count_group(buf, (uint8_t)len, 1) > 0, "scope=mesh = mesh only");
     len = iotdata_node_build(&n, IOTDATA_NODE_TLV_STATUS, buf, sizeof(buf), IOTDATA_NODE_STATUS_SCOPE_NODE, NULL);
     CHECK(len > 0 && count_group(buf, (uint8_t)len, 0) > 0 && count_group(buf, (uint8_t)len, 1) == 0, "scope=node = node only");
+
+    /* THE TABLE SEAM, which an end device had no way to answer until the content store gave it a
+       table: `stat content` came back with the scalars and silence where the rows should have been.
+       The relay and the gateway have had this pair all along; this is the same algorithm. */
+    {
+        const iotdata_node_params_t tabled = { .caps = &caps, .status = st_cb, .tx = tx_cb, .table_count = tbl_count_cb, .table_row = tbl_row_cb, .receive_always = true };
+        iotdata_node_attach(&n, &tabled);
+        tbl_rows = 3;
+        len = iotdata_node_build(&n, IOTDATA_NODE_TLV_STATUS, buf, sizeof(buf), IOTDATA_NODE_STATUS_SCOPE_CONTENT, NULL);
+        CHECK(len > 0 && count_key(buf, (uint8_t)len, IOTDATA_NODE_STATUS_CONTENT_ENTRY) == 3, "the content scope answers with its rows");
+        /* THE COUNT IS A SCALAR AND IS IN THE NODE GROUP, so asking for the rows alone does not
+           carry it -- which is the caller's own choice, and the reason every scalar is emitted
+           before any entry. */
+        len = iotdata_node_build(&n, IOTDATA_NODE_TLV_STATUS, buf, sizeof(buf), IOTDATA_NODE_STATUS_SCOPE_NODE, NULL);
+        CHECK(len > 0 && count_key(buf, (uint8_t)len, IOTDATA_NODE_STATUS_CONTENT_COUNT) == 1, "the node group carries the count");
+        CHECK(count_key(buf, (uint8_t)len, IOTDATA_NODE_STATUS_CONTENT_ENTRY) == 0, "and not the rows");
+        /* AN EMPTY TABLE STILL SAYS SO: a manager asking whether an offer landed wants "none"
+           rather than silence, which is why has_content is set from having the table at all. */
+        tbl_rows = 0;
+        len = iotdata_node_build(&n, IOTDATA_NODE_TLV_STATUS, buf, sizeof(buf), IOTDATA_NODE_STATUS_SCOPE_NODE, NULL);
+        CHECK(len > 0 && count_key(buf, (uint8_t)len, IOTDATA_NODE_STATUS_CONTENT_COUNT) == 1, "a node with no content reports zero, not nothing");
+        /* MORE ROWS THAN ONE REPORT HOLDS: paged, and the loop says so rather than stopping
+           quietly, which would be a node under-reporting what it holds with nothing to show it. */
+        tbl_rows = 200;
+        iotdata_node_partial_t part = { 0 };
+        int chunks = 0, rows = 0;
+        do {
+            len = iotdata_node_build(&n, IOTDATA_NODE_TLV_STATUS, buf, sizeof(buf), IOTDATA_NODE_STATUS_SCOPE_CONTENT, &part);
+            CHECK(len > 0, "each page builds");
+            rows += count_key(buf, (uint8_t)len, IOTDATA_NODE_STATUS_CONTENT_ENTRY);
+            chunks++;
+        } while (part.more && chunks < 40);
+        CHECK(chunks > 1, "two hundred rows take more than one report");
+        CHECK(rows == 200, "and every row is carried exactly once");
+        tbl_rows = 0;
+    }
+
+    /* a node with NO table seam says nothing at all about a table, rather than reporting zeroes
+       for three it does not keep -- stations and filters belong to a node whose job is hearing
+       other nodes. */
+    {
+        const iotdata_node_params_t untabled = { .caps = &caps, .status = st_cb, .tx = tx_cb, .receive_always = true };
+        iotdata_node_attach(&n, &untabled);
+        len = iotdata_node_build(&n, IOTDATA_NODE_TLV_STATUS, buf, sizeof(buf), IOTDATA_NODE_STATUS_SCOPE_NODE, NULL);
+        CHECK(len > 0 && count_key(buf, (uint8_t)len, IOTDATA_NODE_STATUS_CONTENT_COUNT) == 0, "no table, no count");
+        len = iotdata_node_build(&n, IOTDATA_NODE_TLV_STATUS, buf, sizeof(buf), IOTDATA_NODE_STATUS_SCOPE_CONTENT, NULL);
+        CHECK(len == 0, "and the content scope answers empty");
+    }
 
     /* a plain end device: in no mesh, so the mesh scope yields an EMPTY status, not the node group */
     const iotdata_node_params_t plain = { .caps = &caps, .status = st_cb, .tx = tx_cb, .receive_always = true };
@@ -308,7 +382,7 @@ int main(void) {
     iotdata_kvr_add(&b, IOTDATA_NODE_CONTROL_CONTROL, theirs, (uint8_t)sizeof(theirs));
     bool reboot = false;
     iotdata_node_attach(&n, &both);
-    iotdata_node_process_control(&n, kv, b.len, &reboot);
+    iotdata_node_process_control(&n, kv, b.len, 7000u, &reboot);
     CHECK(seen_key == IOTDATA_NODE_ACTION_MESH_PEERS_CLEAR, "the hook got the action it claims");
     CHECK(n.stat_commands == 1, "a claimed action is a command");
     CHECK(n.stat_unknown == 1, "an UNCLAIMED action is unknown");
@@ -321,7 +395,7 @@ int main(void) {
     iotdata_kvr_init(&b2, kv2, sizeof(kv2));
     const uint8_t declined[2] = { IOTDATA_NODE_SUBJECT_MESH, IOTDATA_NODE_ACTION_MESH_PEERS_DUMP };
     iotdata_kvr_add(&b2, IOTDATA_NODE_CONTROL_CONTROL, declined, (uint8_t)sizeof(declined));
-    iotdata_node_process_control(&n, kv2, b2.len, &reboot);
+    iotdata_node_process_control(&n, kv2, b2.len, 7000u, &reboot);
     CHECK(n.stat_refused == 1, "a claimed-and-declined action is refused");
     CHECK(n.stat_commands == 1, "and is NOT counted as serviced");
     CHECK(n.stat_unknown == 1, "nor as unknown -- that was the misreport");
@@ -335,7 +409,7 @@ int main(void) {
     iotdata_kvr_init(&b2, kv2, sizeof(kv2));
     const uint8_t roll[2] = { IOTDATA_NODE_SUBJECT_NODE, IOTDATA_NODE_ACTION_NODE_ROLLBACK };
     iotdata_kvr_add(&b2, IOTDATA_NODE_CONTROL_CONTROL, roll, (uint8_t)sizeof(roll));
-    iotdata_node_process_control(&n, kv2, b2.len, &reboot);
+    iotdata_node_process_control(&n, kv2, b2.len, 7000u, &reboot);
     CHECK(n.stat_refused == was_refused + 1, "rollback with no fallback slot is refused");
     CHECK(n.stat_unknown == was_unknown, "and not called unimplemented");
 

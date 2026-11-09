@@ -6,7 +6,7 @@
 ## warnings on and actually run.
 ##
 
-IOTDATA_SRC          = ../..
+IOTDATA_SRC          = ../../..
 IOTDATA_SRC_LIBRARY  = $(IOTDATA_SRC)/iotdata-library
 IOTDATA_SRC_PLATFORM = $(IOTDATA_SRC)/iotdata-platform
 IOTDATA_SRC_EXAMPLE  = $(IOTDATA_SRC)/iotdata-example
@@ -70,6 +70,23 @@ test:
 # standing in for one -- see the note in that header
 	@$(TEST_CC) $(TEST_CFLAGS) -I$(IOTDATA_SRC_PLATFORM)/include/device -I$(IOTDATA_SRC_HPATCH) test_node_content_ota_apply.c -o $(TEST_DIR)/test_node_content_ota_apply -lm -lz
 	@$(TEST_DIR)/test_node_content_ota_apply
+# the OFFERS table: the manifest half, which is the store's protocol-aware counterpart. Needs the
+# library on the path as well as the seam, because a manifest IS protocol -- its codec, its expiry
+# sentinels and its revocation rule all live in iotdata_node.h.
+	@$(TEST_CC) $(TEST_CFLAGS) -I$(IOTDATA_SRC_PLATFORM)/include/device test_node_content_manifest.c $(IOTDATA_SRC_LIBRARY)/iotdata.c -o $(TEST_DIR)/test_node_content_manifest -lm
+	@$(TEST_DIR)/test_node_content_manifest
+# again with a table of two rows, which is the only way the full-table refusal is reachable
+	@$(TEST_CC) $(TEST_CFLAGS) -I$(IOTDATA_SRC_PLATFORM)/include/device -DIOTDATA_NODE_CONTENT_MANIFESTS_MAX=2 test_node_content_manifest.c $(IOTDATA_SRC_LIBRARY)/iotdata.c -o $(TEST_DIR)/test_node_content_manifest_tight -lm
+	@$(TEST_DIR)/test_node_content_manifest_tight
+# A MANIFEST'S WHOLE LIFE, across four nodes on a fake air, with real frames: authored in two
+# places, advertised, heard or ignored for each of the four reasons, pulled, checked against the
+# offer that described it, superseded, revoked. The receive branch in that suite is the one the
+# applications will call, written where it can be driven.
+# READVERTISE_MIN_S=0: this suite is about REACH -- who hears an offer and who does not -- and it
+# re-originates several times within a simulated second to get there. The floor under
+# re-origination has its own tests in test_node_content_manifest.c, where the clock is explicit.
+	@$(TEST_CC) $(TEST_CFLAGS) -I$(IOTDATA_SRC_PLATFORM)/include/device -DIOTDATA_NODE_CONTENT_READVERTISE_MIN_S=0 test_node_content_lifecycle.c $(IOTDATA_SRC_LIBRARY)/iotdata.c -o $(TEST_DIR)/test_node_content_lifecycle -lm
+	@$(TEST_DIR)/test_node_content_lifecycle
 # the console and CONTROL words over that same backend. The one suite here that catches stdout,
 # because for a download the reply IS the protocol that esp32-tool parses.
 	@$(TEST_CC) $(TEST_CFLAGS) -I$(IOTDATA_SRC_PLATFORM)/include/device test_node_console_content.c -o $(TEST_DIR)/test_node_console_content -lm

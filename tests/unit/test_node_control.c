@@ -132,11 +132,93 @@ static void test_console(void) {
     CHECK(argv_find(&a, &used, 5, "mesh", "peers", "update", "0x537", "sideways") == NULL, "an action that is not an action");
     CHECK(argv_find(&a, &used, 4, "mesh", "peers", "update", "0x537") != NULL, "but the station alone is enough");
 
+    /* THE SIGNATURE STREAM IS MANDATORY WHERE A PERSON TYPES IT and forgiving everywhere below --
+       §3 makes it "mandatory to provide, optional to use", and this is the half that provides. A
+       manifest with no stream behind it is not supposed to exist, so an offer typed without one
+       does not resolve at all rather than quietly carrying 0. */
+    CHECK(argv_find(&a, &used, 3, "content", "manifest", "1a2b3c") == NULL, "an offer with no signature stream is not a command");
+    c = argv_find(&a, &used, 4, "content", "manifest", "1a2b3c", "1a2b3d");
+    CHECK(c != NULL && a.content == 0x1a2b3cu && a.content_sig == 0x1a2b3du, "naming one resolves, id then stream");
+    CHECK(c != NULL && a.content_expiry_m == IOTDATA_CONTENT_EXPIRY_INDEFINITE, "and an unsaid expiry OFFERS rather than revokes");
+    /* `self` is the deliberate zero: a signature stream's own manifest names no stream, because
+       hashing the hashes would recurse without end. Saying so is allowed; forgetting is not. */
+    c = argv_find(&a, &used, 4, "content", "manifest", "1a2b3c", "self");
+    CHECK(c != NULL && a.content_sig == IOTDATA_CONTENT_SIG_NONE, "`self` says it IS one");
+    CHECK(argv_find(&a, &used, 4, "content", "manifest", "1a2b3c", "sideways") == NULL, "and a word that is neither is refused");
+    c = argv_find(&a, &used, 7, "content", "manifest", "1a2b3c", "1a2b3d", "img", "1440", "11");
+    CHECK(c != NULL && a.content_expiry_m == 1440u && a.content_encoding == 0x11u && strcmp(a.content_name, "img") == 0, "then name, expiry and encoding in order");
+    /* the audience is optional, because an advertisement is normally for everybody */
+    c = argv_find(&a, &used, 3, "content", "advertise", "1a2b3c");
+    CHECK(c != NULL && a.station == 0u, "an advertisement with no audience leaves the field unsaid");
+    c = argv_find(&a, &used, 4, "content", "advertise", "1a2b3c", "0x57d");
+    CHECK(c != NULL && a.station == 0x57Du, "and a named one is read");
+
+    /* A STATION IS THE WHOLE WORD OR IT IS NOT A STATION. `57d` is how every log line and every
+       MQTT topic in this system spells 0x57D, and it used to parse as decimal 57 and send the
+       command to a different node in silence. Decimal stays the default -- changing that would
+       redirect existing scripts -- so what is refused is the ambiguous spelling. */
+    CHECK(argv_find(&a, &used, 4, "node", "filters", "update", "57d") == NULL, "a bare hex station is refused, not read as 57");
+    c = argv_find(&a, &used, 4, "node", "filters", "update", "0x57d");
+    CHECK(c != NULL && a.station == 0x57Du, "with the 0x it is the station it looks like");
+    c = argv_find(&a, &used, 4, "node", "filters", "update", "1405");
+    CHECK(c != NULL && a.station == 0x57Du, "and decimal still means decimal: the same node");
+    /* and a leading zero is not octal: `057` was station 47 under strtol's base 0 */
+    c = argv_find(&a, &used, 4, "node", "filters", "update", "057");
+    CHECK(c != NULL && a.station == 57u, "a leading zero is decimal, not octal");
+    CHECK(argv_find(&a, &used, 4, "node", "filters", "update", "12abc") == NULL, "and trailing rubbish is refused rather than ignored");
+
     CHECK(argv_find(&a, &used, 1, "nonesuch") == NULL, "an unknown verb resolves to nothing");
     CHECK(argv_find(&a, &used, 2, "mesh", "nonesuch") == NULL, "and so does an unknown subcommand");
     /* absent target is BROADCAST, as it is over MQTT: "this command, to whoever hears it" */
     c = argv_find(&a, &used, 1, "vers");
     CHECK(c != NULL && a.target == IOTDATA_STATION_BROADCAST, "no target named means broadcast");
+}
+
+/* EVERY COMMAND IN THE TABLE MUST BUILD, into a buffer sized by IOTDATA_NODE_CONTROL_BUILD_MAX.
+   That is the guard the two stale hand-counted bounds needed: a number living in an application
+   cannot notice that this table grew, and both times it did not -- `* update <station> <action>`
+   overflowed by two bytes, and MANIFEST by twenty. Walking the vocabulary cannot go stale. */
+static void test_every_command_builds(void) {
+    printf("the whole vocabulary packs into the bound it publishes\n");
+    iotdata_node_control_args_t a = { 0 };
+    a.target = IOTDATA_STATION_BROADCAST;
+    a.station = 0x057Du;
+    a.content = 0x001003u;
+    a.content_sig = 0x001004u;
+    a.content_expiry_m = 1440u;
+    a.content_encoding = 0x11u;
+    a.scope_filter = IOTDATA_NODE_CONTROL_NODE_FILTERS_SCOPE_ALL;
+    /* THE WORST CASE IS THE WIDEST NAME, because that is what the bound is sized for: a name one
+       byte over is the whole of what went wrong. */
+    memset(a.content_name, 'z', sizeof(a.content_name) - 1u);
+    a.content_name[sizeof(a.content_name) - 1u] = '\0';
+
+    int n = 0;
+    for (uint8_t i = 0;; i++) {
+        const iotdata_node_control_command_t *const c = iotdata_node_control_at(i);
+        if (c == NULL)
+            break;
+        uint8_t buf[IOTDATA_NODE_CONTROL_BUILD_MAX];
+        iotdata_kvr_t kv;
+        iotdata_kvr_init(&kv, buf, sizeof(buf));
+        const bool ok = iotdata_node_control_build(&kv, c, &a);
+        if (!ok || kv.overflow) {
+            printf("  FAIL: '%s' does not build into %u bytes (len=%u overflow=%d)\n", c->name, (unsigned)IOTDATA_NODE_CONTROL_BUILD_MAX, (unsigned)kv.len, (int)kv.overflow);
+            fails++;
+        }
+        n++;
+    }
+    CHECK(n > 20, "the whole table was walked, not an empty one");
+    /* AND THE BOUND IS NOT SILLY: a buffer one byte short of it must actually fail for the widest
+       command, or the number is bigger than it needs to be and proves nothing. */
+    const iotdata_node_control_command_t *const widest = iotdata_node_control_find("content-manifest");
+    CHECK(widest != NULL, "the widest command is in the table");
+    if (widest != NULL) {
+        uint8_t tight[IOTDATA_NODE_CONTROL_BUILD_MAX - 1u];
+        iotdata_kvr_t kv;
+        iotdata_kvr_init(&kv, tight, sizeof(tight));
+        CHECK(!iotdata_node_control_build(&kv, widest, &a) || kv.overflow, "one byte short of the bound is not enough");
+    }
 }
 
 /* THE point of the header: two media, one result. */
@@ -146,7 +228,7 @@ static void test_media_agree(void) {
     static const struct {
         const char *json;
         int argc;
-        const char *argv[5];
+        const char *argv[8]; /* `content manifest <id> <name> <expiry> <enc> <sig>` is the longest */
     } cases[] = {
         { "{\"cmd\":\"mesh-peers-update\",\"station\":\"0x537\",\"action\":\"remove\"}", 5, { "mesh", "peers", "update", "0x537", "remove" } },
         { "{\"cmd\":\"node-filters-update\",\"station\":\"0xABC\",\"action\":\"block\"}", 5, { "node", "filters", "update", "0xABC", "block" } },
@@ -154,12 +236,27 @@ static void test_media_agree(void) {
         { "{\"cmd\":\"diag-bbox-enable\"}", 3, { "diag", "bbox", "enable" } },
         { "{\"cmd\":\"stat\",\"scope\":\"mesh\"}", 2, { "stat", "mesh" } },
         { "{\"cmd\":\"vers\"}", 1, { "vers" } },
+        /* THE OFFERS HALF, which is the one place the two media take the same fields in different
+           SHAPES: a console reads four optional words positionally, a request names them. Identical
+           bytes is the only thing that keeps those two readings honest. */
+        { "{\"cmd\":\"content-manifest\",\"content\":\"1a2b3c\",\"name\":\"img\",\"expiry\":1440,\"encoding\":\"11\",\"sig\":\"1a2b3d\"}", 7, { "content", "manifest", "1a2b3c", "1a2b3d", "img", "1440", "11" } },
+        /* and with everything optional left out, so the DEFAULTS have to agree too -- an omitted
+           expiry must mean indefinite through both, never the zero that revokes */
+        /* `self` is how a signature stream's OWN manifest says it names none -- the field cannot
+           be omitted, but it can deliberately be zero. */
+        { "{\"cmd\":\"content-manifest\",\"content\":\"1a2b3c\",\"sig\":\"0\"}", 4, { "content", "manifest", "1a2b3c", "self" } },
+        { "{\"cmd\":\"content-manifest\",\"content\":\"1a2b3c\",\"name\":\"img\",\"expiry\":\"indefinite\",\"sig\":\"1a2b3d\"}", 6, { "content", "manifest", "1a2b3c", "1a2b3d", "img", "indefinite" } },
+        { "{\"cmd\":\"content-advertise\",\"content\":\"1a2b3c\",\"station\":\"0x57d\"}", 4, { "content", "advertise", "1a2b3c", "0x57d" } },
+        /* no audience named: everybody, which is what an advertisement normally is */
+        { "{\"cmd\":\"content-advertise\",\"content\":\"1a2b3c\"}", 3, { "content", "advertise", "1a2b3c" } },
+        { "{\"cmd\":\"content-revoke\",\"content\":\"1a2b3c\"}", 3, { "content", "revoke", "1a2b3c" } },
+        { "{\"cmd\":\"content-manifests\"}", 2, { "content", "manifests" } },
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         cJSON *const root = cJSON_Parse(cases[i].json);
         iotdata_node_control_args_t ja, ca;
         const iotdata_node_control_command_t *const jc = iotdata_node_control_from_json(root, &ja);
-        char *v[5];
+        char *v[8];
         for (int k = 0; k < cases[i].argc; k++)
             v[k] = (char *)(uintptr_t)cases[i].argv[k];
         const iotdata_node_control_command_t *const cc = iotdata_node_control_from_argv(cases[i].argc, v, &ca, NULL);
@@ -237,6 +334,7 @@ int main(void) {
     test_vocabulary();
     test_app_commands();
     test_console();
+    test_every_command_builds();
     test_media_agree();
     test_report();
     printf(fails ? "\nFAILED (%d)\n" : "\nall ok\n", fails);
