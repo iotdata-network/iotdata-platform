@@ -14,6 +14,9 @@ Subcommands:
     flash     write a build dir's bootloader + partition-table + app to the chip
     monitor   print the serial console, interactive (type to the device's CLI); reconnects.
               Does NOT reset by default (so it won't reboot a running node) — pass -r to reset.
+              Redirected to a file it is a recorder: no colour, and a line at a time.
+    reset     pulse the reset line and exit. For a board with no console this is the only way
+              to put it back into a known state without reaching for the cable.
     command   issue ONE command to a running device and print just its response (C-tagged
               lines), filtering out log noise — for scripting. e.g. `command vers`.
     content   put a file into a node's content store over the console, or pull one back out
@@ -114,6 +117,17 @@ COLORS = {
 RESET = "\033[0m"
 RED = "\033[31m"
 CYAN = "\033[36m"
+
+# COLOUR IS FOR A TERMINAL; A FILE IS EVIDENCE. Redirected, a monitor is a recorder -- for a node
+# with no console it is the only observation there is -- and whoever reads that file later greps it.
+# ANSI codes are noise in it. Buffering matters more: python block-buffers stdout to a pipe or file,
+# so a line can sit unwritten for minutes, which reads exactly like a node that went quiet. Every
+# line is flushed as it arrives, and a reader tailing the file sees what the board said when it
+# said it.
+TTY_OUT = sys.stdout.isatty()
+
+def paint(code, text):
+    return f"{code}{text}{RESET}" if TTY_OUT else text
 LOG_RE = re.compile(r"^[CIDEW] \(\d+\) ")
 # Command output is a pseudo log line "C (<ms>) <message>" (iotdata_command.h). Capture the message.
 CMD_RE = re.compile(r"^C \(\d+\) (.*)$")
@@ -155,10 +169,10 @@ def log_line(text):
 
 def print_line(line):
     match = LOG_RE.match(line)
-    if match and line[0] in COLORS:
-        print(f"{COLORS[line[0]]}{line}{RESET}")
+    if TTY_OUT and match and line[0] in COLORS:
+        print(f"{COLORS[line[0]]}{line}{RESET}", flush=True)
     else:
-        print(line)
+        print(line, flush=True)
     log_line(line)
 
 # --------------------------------------------------------------------------------------
@@ -294,6 +308,27 @@ def require_port(args):
     if serial_norm(got) != want and not serial_norm(got).endswith(want):
         die(f"{args.port} is board {got}, not {spec} -- refusing")
 
+# THE PULSE THAT RESETS A BOARD: RTS drives EN, DTR drives GPIO0. It is the same auto-reset the
+# flashing tools use, which is why it needs no toolchain and no cooperation from the firmware -- and
+# so it works on a board whose application has wedged, or which has no console to be told anything.
+def reset_pulse(s):
+    """Hold EN low briefly, GPIO0 high so the application boots and not the bootloader."""
+    s.dtr = False
+    s.rts = True
+    time.sleep(0.15)
+    s.rts = False
+    time.sleep(0.05)
+
+def do_reset(port):
+    import serial  # lazily, as monitor does: `flash` works without pyserial
+    try:
+        with serial.Serial(port, 115200, timeout=1) as s:
+            reset_pulse(s)
+    except OSError as e:
+        die(f"could not reset {port}: {e}")
+    print(f"reset {port}")
+    return 0
+
 def monitor(port, command=None, reset=False, serial_want=None):
     import serial  # imported lazily so `flash` works without pyserial
     # Forward the terminal's stdin to the device so typed commands reach its console CLI. In cooked
@@ -306,7 +341,7 @@ def monitor(port, command=None, reset=False, serial_want=None):
     first_connect = True
     while True:
         if not first_connect:
-            print(f"{RED}--- DEVICE DISCONNECTED{RESET}", flush=True)
+            print(paint(RED, "--- DEVICE DISCONNECTED"), flush=True)
             log_line("--- DEVICE DISCONNECTED")
             wait_for_port(port)
             # Same board? Three identical boards share one /dev node namespace, so a reconnect can
@@ -315,11 +350,11 @@ def monitor(port, command=None, reset=False, serial_want=None):
             if serial_want:
                 got = board_serial(port)
                 if got is None or (serial_norm(got) != serial_norm(serial_want) and not serial_norm(got).endswith(serial_norm(serial_want))):
-                    print(f"{RED}--- {port} is board {got}, not {serial_want} -- still waiting{RESET}", flush=True)
+                    print(paint(RED, f"--- {port} is board {got}, not {serial_want} -- still waiting"), flush=True)
                     while os.path.exists(port):
                         time.sleep(0.2)
                     continue
-            print(f"\n{RED}--- DEVICE RECONNECTED{RESET}", flush=True)
+            print(paint(RED, "\n--- DEVICE RECONNECTED"), flush=True)
             log_line("--- DEVICE RECONNECTED")
             buf = b""
         try:
@@ -327,12 +362,11 @@ def monitor(port, command=None, reset=False, serial_want=None):
                 if first_connect:
                     if reset:
                         try:
-                            s.dtr = False
-                            s.rts = True
-                            time.sleep(0.1)
-                            s.rts = False
+                            reset_pulse(s)
                         except OSError:
                             pass
+                    print(paint(CYAN, f"--- DEVICE CONNECTED {port}"), flush=True)
+                    log_line(f"--- DEVICE CONNECTED {port}")
                     first_connect = False
                 elif command:
                     # device is already booting — preload the command so it's in the
@@ -943,6 +977,8 @@ def main():
     add_common(p_mon)
     p_mon.add_argument("-l", "--log", metavar="FILE", default=None, help="also write the console to FILE, timestamp-suffixed (relay.log -> relay-20260911T121530.log; a directory gets esp32-<stamp>.log)")
     p_mon.add_argument("-r", "--reset", action="store_true", help="reset the device on connect (off by default)")
+    p_reset = sub.add_parser("reset", help="pulse the reset line and exit (a board with no console has no other way back)")
+    add_common(p_reset)
     p_mon.add_argument("command", nargs="?", default=None, help="command string to inject after boot")
     p_dep = sub.add_parser("deploy", help="flash, then monitor")
     add_common(p_dep, build=True)
@@ -989,6 +1025,9 @@ def main():
         if logged:
             print(f"{CYAN}--- logging to {logged}{RESET}", flush=True)
 
+    if args.cmd == "reset":
+        require_port(args)
+        sys.exit(do_reset(args.port))
     if args.cmd == "monitor":
         require_port(args)
         try:

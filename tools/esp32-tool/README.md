@@ -11,6 +11,7 @@ flashing — not the compiler, cmake or ninja.
 esp32-tool flash    -p PORT -b BUILD_DIR [--pull HOST:PATH]   # write image to chip
 esp32-tool monitor  -p PORT [command]                          # print console (interactive)
 esp32-tool command  -p PORT <cmd>                              # one command, just its answer
+esp32-tool reset    -p PORT                                    # pulse the reset line and exit
 esp32-tool diag     extract|decode|clear                       # blackbox diagnostics partition
 esp32-tool deploy   -p PORT -b BUILD_DIR [--pull HOST:PATH]    # flash, then monitor
 ```
@@ -89,6 +90,26 @@ esp32-tool diag clear --confirm          # erase it
 
 NB `diag` and `flash` reset the device; `monitor` does not unless you pass `-r`.
 
+## Resetting, and watching, a board with no console
+
+`reset` pulses the line and exits — RTS drives EN, DTR drives GPIO0, the same auto-reset the
+flashing tools use, so it needs no toolchain and no cooperation from the firmware. That matters for
+a node whose application has wedged, and more for one with **no console at all**: a sensor cannot be
+told to forget anything, so a pulse is the only way back to a known state short of reaching for the
+cable. Being a subcommand it takes `-s MAC` like the rest, which is the point — `ttyACM`
+numbering moves across exactly the reset you are performing.
+
+Redirected to a file, `monitor` is a **recorder**: no colour, and every line flushed as it arrives
+rather than when a buffer fills. It prints `--- DEVICE CONNECTED <port>` when it attaches, so a
+script can tell "started and attached" from "started and died on a busy port" — and it keeps
+monitoring when its stdin is `/dev/null`. The system tests in `iotdata-testing` use it exactly this
+way for the sensors, which have no other voice:
+
+```sh
+esp32-tool monitor -p /dev/ttyACM0 >> sensor1.log 2>&1 &   # the only observation there is
+esp32-tool reset   -p /dev/ttyACM0                          # back to an empty table
+```
+
 ## Installing
 
 The tool is one self-contained python file, so a host with boards plugged into it needs neither
@@ -115,7 +136,7 @@ None of these is the compiler toolchain, and the tool is useful before they are 
 | For | Needs | Install |
 |---|---|---|
 | `list`, and everything | python3 | the only hard requirement |
-| `monitor`, `command` | python3, pyserial | `python3-serial`, or `pip install pyserial` |
+| `monitor`, `command`, `reset` | python3, pyserial | `python3-serial`, or `pip install pyserial` |
 | `flash`, `diag` | esptool | `esptool` (apt), or `pip install esptool` |
 | `--pull` | rsync + ssh | usually already present |
 
