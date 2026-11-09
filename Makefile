@@ -28,7 +28,7 @@ FORMAT_SOURCES := \
     $(wildcard $(_HERE)/include/*.h) \
     $(wildcard $(_HERE)/include/device/*.h) \
     $(wildcard $(_HERE)/apps/*.c) \
-    $(wildcard $(_HERE)/tests/*.c)
+    $(wildcard $(_HERE)/tests/unit/*.c)
 
 ##
 
@@ -54,7 +54,7 @@ config: ## show the resolved paths and file counts
 	@echo "  include/*.h         $(words $(wildcard $(_HERE)/include/*.h))"
 	@echo "  include/device/*.h  $(words $(wildcard $(_HERE)/include/device/*.h))"
 	@echo "  apps/*.c            $(words $(wildcard $(_HERE)/apps/*.c))"
-	@echo "  tests/*.c           $(words $(wildcard $(_HERE)/tests/*.c))"
+	@echo "  tests/unit/*.c      $(words $(wildcard $(_HERE)/tests/unit/*.c))"
 
 help: ## this list
 	@echo "iotdata-platform — headers, app bodies and host tests; nothing to build"
