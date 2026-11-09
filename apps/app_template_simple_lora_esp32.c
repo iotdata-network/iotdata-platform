@@ -160,15 +160,40 @@ static bool _iapp_node_config_apply(const uint8_t *buf, size_t len, bool *reboot
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
+static const char *__tag_iapp = "iapp";
+
 static filestore_esp32_t _iapp_filestore;
 static iotdata_node_content_t _iapp_content;
+static iotdata_node_content_manifests_t _iapp_offers; /* what it has been TOLD content is */
 
-static iotdata_node_control_result_t _iapp_node_control(__attribute__((unused)) const uint16_t station, const uint8_t subject, const uint8_t action, const uint8_t *const val, const uint8_t vlen, const char **const reason) {
+static void _iapp_node_content(const uint8_t *const val, const uint8_t vlen, const uint32_t now_ms) {
+    uint8_t kind = 0;
+    if (iotdata_content_header_parse(val, vlen, &kind, NULL, NULL) && kind == IOTDATA_CONTENT_MANIFEST) {
+        uint32_t id = 0u;
+        const iotdata_node_content_status_t rc = iotdata_node_content_manifest_on_wire(&_iapp_offers, &_iapp_content, val, vlen, now_ms, &id);
+        char line[IOTDATA_NODE_CONTENT_MANIFEST_STR_MAX + 1];
+        if (rc == IOTDATA_NODE_CONTENT_OK)
+            ESP_LOGI(__tag_iapp, "content: offer heard -- %s", iotdata_node_content_manifest_str(line, sizeof(line), iotdata_node_content_manifest_find(&_iapp_offers, id), now_ms));
+        else
+            ESP_LOGW(__tag_iapp, "content: offer %06" PRIx32 " not taken -- %s", id, iotdata_node_content_status_name(rc));
+    }
+}
+
+static uint8_t _iapp_node_table_count(const uint8_t entry) {
+    return (entry == IOTDATA_NODE_STATUS_CONTENT_ENTRY) ? iotdata_node_content_table_count(&_iapp_content, &_iapp_offers) : 0u;
+}
+
+static bool _iapp_node_table_row(const uint8_t entry, const uint8_t index, uint8_t *const row) {
+    return (entry == IOTDATA_NODE_STATUS_CONTENT_ENTRY) && iotdata_node_content_table_row(&_iapp_content, &_iapp_offers, index, row, (uint32_t)hw_time_ms());
+}
+
+static iotdata_node_control_result_t _iapp_node_control(__attribute__((unused)) const uint16_t station, const uint8_t subject, const uint8_t action, const uint8_t *const val, const uint8_t vlen, const uint32_t now_ms,
+                                                        const char **const reason) {
     switch (subject) {
     case IOTDATA_NODE_TLV_DIAGNOSTICS:
         return iotdata_node_control_result_of(iotdata_node_diagnostics_control(subject, action, val, vlen));
     case IOTDATA_NODE_TLV_CONTENT:
-        return iotdata_node_content_control(subject, action, val, vlen, reason);
+        return iotdata_node_content_control(subject, action, val, vlen, now_ms, reason);
     default:
         return IOTDATA_NODE_CONTROL_RESULT_UNKNOWN; /* not ours: the node layer counts it unknown */
     }
@@ -218,6 +243,9 @@ static iapp_running_t _iapp_running = {
         .status = _iapp_node_status,
         .tx = _iapp_node_transmit,
         .control = _iapp_node_control,
+        .content = _iapp_node_content,
+        .table_count = _iapp_node_table_count,
+        .table_row = _iapp_node_table_row,
         .control_actions = _iapp_control_actions,
         .control_actions_count = IAPP_CONTROL_ACTIONS_COUNT,
         .diag = IOTDATA_NODE_DIAGNOSTICS_PULL,
@@ -301,8 +329,6 @@ extern const app_descr_t *app_spec;
 #define RESTART_MS 30000 /* duration of restart on failure */
 #endif
 
-static const char *__tag_iapp = "iapp";
-
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
@@ -382,10 +408,11 @@ static void iapp_node_receive(iapp_state_t *const as) {
     for (uint32_t now_ms = (uint32_t)hw_time_ms(); iotdata_node_window_active(n, now_ms); now_ms = (uint32_t)hw_time_ms()) {
         iotdata_node_diagnostics_tick(now_ms); /* clock + canary, and a DUMP that arrived in this window drains inside it */
         (void)iotdata_node_content_tick(&_iapp_content, now_ms);
+        (void)iotdata_node_content_manifests_tick(&_iapp_offers, &_iapp_content, now_ms);
         int len = 0, rssi_dbm = 0;
         if (lora_read(as->running->packet_buffer, sizeof(as->running->packet_buffer), &len, &rssi_dbm, 0) == ESP_OK && len > 0) {
             frames++;
-            acted += iotdata_node_on_frame(n, as->running->packet_buffer, (size_t)len, &reboot) ? 1 : 0;
+            acted += iotdata_node_on_frame(n, as->running->packet_buffer, (size_t)len, now_ms, &reboot) ? 1 : 0;
         }
         hw_delay_ms_yieldable(RECEIVE_POLL_MS); /* yield and pat the watchdog: the window is long by MCU standards */
     }
@@ -547,12 +574,17 @@ static bool iapp_init(iapp_state_t *const as) {
         const d_filestore_t *const be = enabled ? filestore_esp32_mount(&_iapp_filestore) : NULL;
         iotdata_node_content_init(&_iapp_content, be);
         iotdata_node_content_control_init(&_iapp_content, NULL); /* no OTA device: not a target yet */
+        iotdata_node_content_manifests_init(&_iapp_offers, be != NULL, iotdata_node_station(&as->operating->node));
+        iotdata_node_content_control_offers_init(&_iapp_offers, NULL, NULL); /* cannot originate: see _iapp_node_content */
         if (!enabled)
             ESP_LOGI(__tag_iapp, "content: disabled -- the store is not mounted");
         else if (be == NULL)
             ESP_LOGW(__tag_iapp, "content: no store -- the `storage` partition would not mount");
         else {
             const int offered = iotdata_node_content_begin(&_iapp_content, (uint32_t)hw_time_ms());
+            const int back = iotdata_node_content_manifests_restore(&_iapp_offers, &_iapp_content, (uint32_t)hw_time_ms());
+            if (back > 0)
+                ESP_LOGI(__tag_iapp, "content: %d offer%s restored from the store", back, (back == 1) ? "" : "s");
             uint32_t total = 0u, used = 0u;
             (void)filestore_esp32_info(&_iapp_filestore, &total, &used);
             ESP_LOGI(__tag_iapp, "content: %" PRIu32 " file(s), %d offered, %u owned, %" PRIu32 " of %" PRIu32 " bytes used", iotdata_node_content_count(&_iapp_content), offered, (unsigned)_iapp_content.owns, used, total);
