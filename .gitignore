@@ -1,1 +1,4 @@
 build_test
+
+# host-local make variables (see iotdata-platform/make/config.mk)
+Makefile.*.defs

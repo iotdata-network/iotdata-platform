@@ -49,6 +49,7 @@ config: ## show the resolved paths and file counts
 	@echo "IOTDATA_SRC          = $(IOTDATA_SRC)"
 	@echo "IOTDATA_SRC_PLATFORM = $(IOTDATA_SRC_PLATFORM)"
 	@echo "IOTDATA_HOST         = $(IOTDATA_HOST)"
+	@echo "IOTDATA_DEFS         = $(if $(IOTDATA_DEFS),$(IOTDATA_DEFS),(none for this host))"
 	@echo "FORMAT               = $(FORMAT)"
 	@echo "FORMAT_SOURCES       = $(words $(FORMAT_SOURCES)) files"
 	@echo "  include/*.h         $(words $(wildcard $(_HERE)/include/*.h))"

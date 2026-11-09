@@ -44,6 +44,29 @@ IOTDATA_SRC_EXAMPLE  ?= $(IOTDATA_SRC)/iotdata-example
 IOTDATA_SRC_DEPLOY   ?= $(IOTDATA_SRC)/iotdata-deploy
 
 # ------------------------------------------------------------------------------------------------
+# HOST-LOCAL MAKE VARIABLES -- the same convention as iotdata_config.<host>.h,
+# sdkconfig.<host>.defaults, <target>.<host>.cfg and lab.<host>.conf: one gitignored file per box,
+# found by hostname, never committed. This is the make-variable member of that set, which was the
+# one missing.
+#
+# WHY IT EXISTS. A knob like NO_SLEEP_DEEP=1 or AE_SDC_CARRIER=0 is true of a DESK, not of the
+# project. Setting one by editing the committed Makefile means it sits in every diff from then on,
+# gets committed by accident eventually, and travels to a box where it is wrong -- and NO_SLEEP_DEEP
+# is exactly the one you least want shipped, which is why the firmware says DO NOT SHIP at boot.
+#
+# THE ORDER IS THE PRECEDENCE, and that is the whole trick. Project knobs are declared `?=`, which
+# assigns only if the name is still unset -- so the FIRST assignment wins, not the last. These are
+# read here, before any project Makefile reaches its own `?=` lines, which turns those lines into
+# the fallbacks they were always written as. Project-local is read before the tree-wide one for the
+# same reason: more specific, earlier, wins. A line that must beat even a command-line assignment
+# says `override`.
+#
+#   iotdata-example/sensor_lora_esp32/Makefile.iotdata-master.defs   this project, this box
+#   Makefile.iotdata-master.defs (beside src/Makefile)               every project, this box
+IOTDATA_DEFS := $(wildcard Makefile.$(IOTDATA_HOST).defs $(IOTDATA_SRC)/Makefile.$(IOTDATA_HOST).defs)
+-include $(IOTDATA_DEFS)
+
+# ------------------------------------------------------------------------------------------------
 # THE DEPLOYMENT -- which site's release tree a build stages into.
 #
 # A release is staged FOR A SITE, not for the world. Each deployment keeps its own tree at
