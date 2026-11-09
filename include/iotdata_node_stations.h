@@ -20,11 +20,34 @@
 // parent -- so sensor traffic must never age-evict the relay you route through. The sets overlap
 // and neither contains the other: a sensor is in here and never a peer.
 //
+// INCLUDE AFTER iotdata.h. The filter has to know which station id means "everybody", because what
+// a whitelist does about broadcast is a decision it has to make -- see
+// FILTER_WHITELIST_IGNORE_BROADCAST. That is the whole of the dependency, and stating the id here
+// instead would be a protocol constant written down twice.
+//
 // ------------------------------------------------------------------------------------------------------------------------
 // ------------------------------------------------------------------------------------------------------------------------
 
 #ifndef FILTER_MAX
 #define FILTER_MAX 16
+#endif
+
+/* WHETHER A WHITELIST ALSO SUPPRESSES BROADCAST, and by default it does not.
+ *
+ * A BLOCK is a statement about one station and needs no exception: blocking IOTDATA_STATION_BROADCAST
+ * says "refuse every broadcast", explicitly and on purpose. A WHITELIST is the awkward one. It says
+ * "only these", and broadcast is not a station -- it is the id a frame wears when it is addressed to
+ * everybody, including every station on the list. So whitelisting two sensors and thereby silencing
+ * the advertisements, beacons and commands those same two sensors are waiting for is almost never
+ * what was meant, and it fails by omission rather than by refusal, which is the hard kind to see.
+ *
+ * It is a BUILD DEFINE rather than a silent rule because the other reading is defensible -- a node
+ * narrowed to two stations arguably should carry nothing else at all -- and because an operator who
+ * wants that should be able to find the knob. Set it to 0 and a whitelist means literally only
+ * those stations. It is the obvious candidate to become a CONFIG row if a site ever needs it per
+ * node rather than per build. */
+#ifndef FILTER_WHITELIST_IGNORE_BROADCAST
+#define FILTER_WHITELIST_IGNORE_BROADCAST 1
 #endif
 
 // ------------------------------------------------------------------------------------------------------------------------
@@ -132,8 +155,15 @@ static inline bool filter_allows(const filter_t *const f, const uint16_t station
             if (e->station == station)
                 is_allowed = true;
         } else if (e->station == station)
-            return false; /* BLOCK wins */
+            return false; /* BLOCK wins, broadcast included: that entry is how you say it */
     }
+    /* See FILTER_WHITELIST_IGNORE_BROADCAST. The BLOCK loop above has already run, so an explicit
+       block on the broadcast id still stands -- this only decides what a whitelist's SILENCE about
+       broadcast means. */
+#if FILTER_WHITELIST_IGNORE_BROADCAST
+    if (station == IOTDATA_STATION_BROADCAST)
+        return true;
+#endif
     return !any_allow || is_allowed;
 }
 

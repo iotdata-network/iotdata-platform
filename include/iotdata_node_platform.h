@@ -21,6 +21,7 @@
 #define IOTDATA_NODE_BLACKBOX_IMPLEMENTATION
 #include "iotdata_node_diagnostics.h"
 #include "iotdata_node_content.h"
+#include "iotdata_node_content_manifest.h"
 #include "iotdata_node_content_ota.h"
 
 // console specific

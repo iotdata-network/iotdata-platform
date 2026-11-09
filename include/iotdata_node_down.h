@@ -193,6 +193,65 @@ static inline uint32_t iotdata_node_down_hash(const uint8_t *const buf, const si
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
+// -----------------------------------------------------------------------------------------------------------------------------------------
+// WHAT WE HAVE ALREADY ACTED ON
+//
+// A down frame addressed to US arrives once per PATH: every gateway that holds it sends it, and
+// every relay that heard it passes it on. Acting on each copy answers it each time -- one
+// `conf-set` came back as four config reports. The bytes are identical whichever way a copy came,
+// because a down frame names its TARGET and carries no sender, so identical bytes inside a short
+// window are one command.
+//
+// THE SAME RULE THE HOLD TABLE ALREADY APPLIES, for the frames that are NOT ours. This is it for
+// the ones that are, and it lives here rather than in an application because every role needs it:
+// the relay had it, the gateway did not, and the gateway therefore refused to act on a BROADCAST
+// at all -- it could not tell another node's broadcast from the echo of its own. With this, it
+// can: a node RECORDS ITS OWN ORIGINATIONS here, so the echo is a repeat by construction and
+// broadcast stops being a special case. One model, every node.
+//
+// A DELIBERATE REPEAT AFTER THE WINDOW IS A NEW COMMAND and is acted on, which is what makes the
+// window short: re-sending something because it seemed not to arrive has to work.
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
+#ifndef IOTDATA_NODE_DOWN_ACTED_WINDOW_MS
+#define IOTDATA_NODE_DOWN_ACTED_WINDOW_MS 30000u
+#endif
+#ifndef IOTDATA_NODE_DOWN_ACTED_SLOTS
+#define IOTDATA_NODE_DOWN_ACTED_SLOTS 8
+#endif
+
+typedef struct {
+    struct {
+        uint32_t hash, at_ms;
+    } slot[IOTDATA_NODE_DOWN_ACTED_SLOTS];
+    uint32_t stat_repeats;
+} iotdata_node_down_acted_t;
+
+/* True if these exact bytes have been seen here inside the window -- and either way the frame is
+   now recorded, so the NEXT copy is a repeat. Call it once per frame and act on the answer.
+ *
+ * ALSO THE WAY A NODE DISOWNS ITS OWN ORIGINATION: record a frame as it goes out and the copy that
+   comes back off a relay is a repeat before anything can act on it. */
+static inline bool iotdata_node_down_acted(iotdata_node_down_acted_t *const a, const uint8_t *const buf, const size_t len, const uint32_t now_ms) {
+    if (a == NULL || buf == NULL || len == 0u)
+        return false;
+    const uint32_t hash = iotdata_node_down_hash(buf, len); /* never 0, so an empty slot never matches */
+    int oldest = 0;
+    for (int i = 0; i < IOTDATA_NODE_DOWN_ACTED_SLOTS; i++) {
+        if (a->slot[i].hash == hash && (now_ms - a->slot[i].at_ms) < (uint32_t)IOTDATA_NODE_DOWN_ACTED_WINDOW_MS) {
+            a->stat_repeats++;
+            return true;
+        }
+        if ((now_ms - a->slot[i].at_ms) > (now_ms - a->slot[oldest].at_ms))
+            oldest = i;
+    }
+    a->slot[oldest].hash = hash;
+    a->slot[oldest].at_ms = now_ms;
+    return false;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------------
+
 static inline void iotdata_node_down_init(iotdata_node_down_t *const ds, buffer_pool_t *const pool) {
     *ds = (iotdata_node_down_t){ 0 };
     ds->pool = pool;
@@ -400,6 +459,25 @@ static inline iotdata_node_down_ev_t iotdata_node_down_offer(iotdata_node_down_t
     sl->arrived_ms = now_ms;
     sl->frame = keep ? buffer_ref(ds->pool, frame) : BUFFER_NONE;
     st->down_last_ms = now_ms;
+    /*
+     * THE BUFFER'S LENGTH IS SET FROM THE ONE WE WERE GIVEN, and that is this table's job rather
+     * than politeness. A slot keeps no length of its own -- it keeps a handle -- so the delivery
+     * path reads buffer_len() back out of the pool. That made the length TWO sources of truth: the
+     * `len` handed in here, and whatever the caller had recorded on the handle.
+     *
+     * They disagreed, and it cost every held frame the gateway ever originated. node_send_down()
+     * encoded into a pooled buffer, passed the length as this argument, and never called
+     * buffer_set_len -- so the immediate transmission went out at the right size and the HELD copy
+     * came back out at zero, was handed to the radio, refused for being empty, and marked
+     * delivered. A command to a node that was not listening was silently dropped by the one
+     * mechanism that exists to stop exactly that, and it went unnoticed because a relay floods the
+     * same frame, holds it with a length its own receive path had set, and delivered it instead.
+     *
+     * Setting it here makes the two agree by construction: whoever fills a buffer may still record
+     * the length (and should), but it can no longer be the only line that matters.
+     */
+    if (keep)
+        buffer_set_len(ds->pool, frame, (uint16_t)len);
 
     if (keep)
         ds->stat_stored++;

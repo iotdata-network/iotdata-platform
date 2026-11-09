@@ -714,7 +714,7 @@ static inline bool iotdata_node_diagnostics_control(const uint8_t subject, const
    compiled out registers no handler at all and advertises no keys, which makes "unknown" the
    truthful answer there rather than a shrug -- see WHAT HAPPENED TO IT in iotdata_node_control.h. */
 static inline iotdata_node_control_result_t iotdata_node_diagnostics_node_control(__attribute__((unused)) const uint16_t station, const uint8_t subject, const uint8_t action, const uint8_t *const args, const uint8_t arglen,
-                                                                                  __attribute__((unused)) const char **const reason) {
+                                                                                  __attribute__((unused)) const uint32_t now_ms, __attribute__((unused)) const char **const reason) {
     return iotdata_node_control_result_of(iotdata_node_diagnostics_control(subject, action, args, arglen));
 }
 
@@ -791,7 +791,8 @@ static inline bool iotdata_node_diagnostics_control(__attribute__((unused)) cons
     return false;
 }
 static inline iotdata_node_control_result_t iotdata_node_diagnostics_node_control(__attribute__((unused)) const uint16_t station, __attribute__((unused)) const uint8_t subject, __attribute__((unused)) const uint8_t action,
-                                                                                  __attribute__((unused)) const uint8_t *const args, __attribute__((unused)) const uint8_t arglen, __attribute__((unused)) const char **const reason) {
+                                                                                  __attribute__((unused)) const uint8_t *const args, __attribute__((unused)) const uint8_t arglen, __attribute__((unused)) const uint32_t now_ms,
+                                                                                  __attribute__((unused)) const char **const reason) {
     return IOTDATA_NODE_CONTROL_RESULT_UNKNOWN;
 }
 

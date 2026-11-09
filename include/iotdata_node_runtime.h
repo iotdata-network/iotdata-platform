@@ -80,7 +80,29 @@ typedef bool (*iotdata_node_tx_fn)(const uint8_t *packet, size_t len);
    and skipped rather than failing the frame), DONE, or REFUSED with an optional `*reason` for the
    console and the log. See WHAT HAPPENED TO IT there for why a bool was not enough. `reason` is
    never NULL; leaving it alone is fine. */
-typedef iotdata_node_control_result_t (*iotdata_node_control_fn)(uint16_t station, uint8_t subject, uint8_t action, const uint8_t *args, uint8_t arglen, const char **reason);
+/* NOW_MS IS THE PASS'S CLOCK AND THE HANDLER MUST NOT READ ONE OF ITS OWN -- the same rule, for the
+   same reason, as iotdata_node_console.h's dispatch. A module that stamps anything from a fresh
+   reading stamps it LATER than the loop's own value, and every `now_ms - then_ms` in the tree is an
+   unsigned subtraction: two milliseconds of the wrong sign is 4.29 billion the right one. The
+   console learned that when `content insert` timed out in the pass that began it; the offers table
+   would learn it as an advertisement that expired a second after it was made. */
+typedef iotdata_node_control_result_t (*iotdata_node_control_fn)(uint16_t station, uint8_t subject, uint8_t action, const uint8_t *args, uint8_t arglen, uint32_t now_ms, const char **reason);
+
+/* A CONTENT TLV addressed to this node -- an offer, today, since RANGES and CHUNKS do not exist
+   yet. Takes the pass's clock for the reason above: an offer is stamped from it. */
+typedef void (*iotdata_node_content_fn)(const uint8_t *val, uint8_t vlen, uint32_t now_ms);
+
+/* A STATUS TABLE this node keeps: how many rows, and one row at a time. Same pair the relay and the
+   gateway have had all along -- an end device could not answer a table scope at all until the
+   content store gave it one to answer, so a `stat content` to a sensor came back with the scalars
+   and silence where the rows should have been.
+ *
+ * NO CLOCK, UNLIKE THE HANDLERS ABOVE, and the difference is real rather than an oversight: a row
+   REPORTS elapsed time and never stamps anything, so a builder reading the clock a millisecond
+   after the pass began makes an age a millisecond larger and nothing else. It is the stamping that
+   must take the caller's value, because `now - stamp` is unsigned everywhere in this tree. */
+typedef uint8_t (*iotdata_node_table_count_fn)(uint8_t entry);
+typedef bool (*iotdata_node_table_row_fn)(uint8_t entry, uint8_t index, uint8_t *row);
 
 /* One diagnostic record per call, from `cursor` (start it at 0), returning its length and 0 when
    there are no more -- the same shape the relay's node layer uses, so a device that gains a
@@ -122,6 +144,17 @@ typedef struct {
     /* Optional: just the rows the last write named (iotdata_node_config_pack_written), which is what
        a write is answered with. Absent, the answer is the whole table, as it always was. */
     int (*config_build_written)(uint8_t *buf, size_t size);
+
+    /* Optional: where a CONTENT TLV goes. A CALLBACK AND NOT A CALL INTO THE MODULE, even though
+       the offers table happens to be visible from here by include order, because this header is
+       also compiled on its own -- the host suite drives it with no content module in sight -- and
+       because what a node does with an offer is the application's business. Absent, a CONTENT TLV
+       is counted unknown, which is the truth for a node that keeps no offers. */
+    iotdata_node_content_fn content;
+    /* Optional, and BOTH OR NEITHER: a count with no row builder would advertise rows nothing can
+       produce, and a row builder with no count would never be asked for one. */
+    iotdata_node_table_count_fn table_count;
+    iotdata_node_table_row_fn table_row;
 
     const uint8_t *control_actions;
     uint8_t control_actions_count;
@@ -398,15 +431,77 @@ static inline int iotdata_node_build_variant(uint8_t *const buf, const size_t si
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static inline int iotdata_node_build_status(const iotdata_node_t *const n, uint8_t *const buf, const size_t size, const uint8_t scope) {
+/*
+ * THE SCALARS, THEN THE ROWS, and it is the relay's node_build_status() algorithm deliberately --
+ * one report shape for every role, so a manager reading a sensor's answer and a relay's is reading
+ * the same thing. Paged through `partial` for the same reason the other builders are: a table can
+ * outgrow one frame, and a report that quietly stopped would be a node under-reporting what it
+ * holds with nothing to say so.
+ *
+ * COUNTS BEFORE THE APP'S CALLBACK, so an application can override one it knows better. `has_image`
+ * after it, because that is the firmware layer's answer and not the app's to give.
+ *
+ * NOTHING IS CLAIMED ABOUT THE TABLES AN END DEVICE DOES NOT KEEP. A relay sets has_stations and
+ * has_filters unconditionally, because "I have heard nobody" is worth reporting from a node whose
+ * job is hearing people; a sensor has neither table, so it says nothing about them rather than
+ * reporting two zeroes forever. `content` IS claimed whenever the node has the table at all, count
+ * zero included -- a manager asking whether an offer landed wants "no" rather than silence.
+ */
+static inline int iotdata_node_build_status(const iotdata_node_t *const n, uint8_t *const buf, const size_t size, const uint8_t scope, iotdata_node_partial_t *const p) {
     const iotdata_node_params_t *const cfg = n->cfg;
     iotdata_kvr_t kv;
     iotdata_kvr_init(&kv, buf, size);
-    iotdata_node_status_t s = { 0 };
-    if (cfg->status)
-        cfg->status(n->station, &s); /* the app knows its own uptime, battery, heap */
-    s.has_image = iotdata_node_firmware_image_status(&s.image);
-    return iotdata_node_status_pack(&kv, &s, scope);
+    const uint32_t cursor = (p != NULL) ? p->cursor : 0u;
+    uint8_t ti = (uint8_t)(cursor >> 16), ri = (uint8_t)(cursor & 0xFFFFu);
+    uint8_t packed = 0;
+    bool more = false;
+    if (cursor == 0u) {
+        const bool tables = (cfg->table_count != NULL && cfg->table_row != NULL);
+        iotdata_node_status_t s = {
+            .has_content = tables,
+            .content = tables ? cfg->table_count(IOTDATA_NODE_STATUS_CONTENT_ENTRY) : 0u,
+        };
+        if (cfg->status)
+            cfg->status(n->station, &s); /* the app knows its own uptime, battery, heap */
+        s.has_image = iotdata_node_firmware_image_status(&s.image);
+        if (iotdata_node_status_pack(&kv, &s, scope) < 0)
+            return -1;
+    }
+    if (cfg->table_count != NULL && cfg->table_row != NULL)
+        while (ti < IOTDATA_NODE_STATUS_TABLE_COUNT && !more) {
+            const iotdata_node_status_table_t *const t = &iotdata_node_status_tables[ti];
+            if ((scope & t->scope) != 0) {
+                const uint8_t count = cfg->table_count(t->entry);
+                for (; ri < count; ri++) {
+                    if (kv.len + 2u + (size_t)t->width > size) {
+                        more = true;
+                        break;
+                    }
+                    uint8_t row[IOTDATA_NODE_STATUS_ENTRY_MAX] = { 0 };
+                    if (cfg->table_row(t->entry, ri, row)) {
+                        iotdata_kvr_add(&kv, t->entry, row, t->width);
+                        packed++;
+                    }
+                }
+            }
+            /* ADVANCED ONLY WHEN A TABLE FINISHED, which is why this is not the loop's own
+               increment any more: an increment runs when the inner loop BREAKS as well as when it
+               completes, so a page that stopped mid-table had `ri` reset to 0 under it and the
+               cursor said "this table, first row" every single time. The report then re-sent its
+               first page for as long as the caller kept asking. Nothing caught it because every
+               table in this tree happens to fit one frame -- the content table, which spans a
+               store AND a set of offers, is the first that does not. */
+            if (!more) {
+                ti++;
+                ri = 0;
+            }
+        }
+    if (p != NULL) {
+        p->chunk = packed;
+        p->more = more;
+        p->cursor = more ? (uint32_t)(((uint32_t)ti << 16) | ri) : 0u; /* ti is still the table that did not finish */
+    }
+    return kv.overflow ? -1 : (int)kv.len;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -484,7 +579,7 @@ static inline int iotdata_node_build(const iotdata_node_t *const n, const uint8_
     case IOTDATA_NODE_TLV_VARIANT:
         return iotdata_node_build_variant(buf, size, scope, partial);
     case IOTDATA_NODE_TLV_STATUS:
-        return iotdata_node_build_status(n, buf, size, scope);
+        return iotdata_node_build_status(n, buf, size, scope, partial);
     case IOTDATA_NODE_TLV_CONFIG:
         return iotdata_node_build_config(n, buf, size, scope, partial);
     case IOTDATA_NODE_TLV_CONTROL:
@@ -566,7 +661,7 @@ static inline void iotdata_node_process_config(iotdata_node_t *const n, const ui
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static inline void iotdata_node_process_control(iotdata_node_t *const n, const uint8_t *const kv, const size_t kvlen, bool *const reboot_out) {
+static inline void iotdata_node_process_control(iotdata_node_t *const n, const uint8_t *const kv, const size_t kvlen, const uint32_t now_ms, bool *const reboot_out) {
     const iotdata_node_params_t *const cfg = n->cfg;
     size_t cur = 0;
     uint8_t key, vlen;
@@ -599,7 +694,7 @@ static inline void iotdata_node_process_control(iotdata_node_t *const n, const u
                 /* not ours: offer it to the app before giving up. A mesh command reaching a node with
                 no mesh lands here and is correctly counted unknown. */
                 const char *reason = NULL;
-                switch (cfg->control ? cfg->control(n->station, subject, action, args, arglen, &reason) : IOTDATA_NODE_CONTROL_RESULT_UNKNOWN) {
+                switch (cfg->control ? cfg->control(n->station, subject, action, args, arglen, now_ms, &reason) : IOTDATA_NODE_CONTROL_RESULT_UNKNOWN) {
                 case IOTDATA_NODE_CONTROL_RESULT_DONE:
                     n->stat_commands++;
                     break;
@@ -633,7 +728,7 @@ static inline void iotdata_node_process_settings(iotdata_node_t *const n, const 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
 /* A frame arrived while our window was open. Returns true if it was a downstream CONTROL for us and we acted on it. */
-static inline bool iotdata_node_on_frame(iotdata_node_t *const n, const uint8_t *const buf, const size_t len, bool *const reboot_out) {
+static inline bool iotdata_node_on_frame(iotdata_node_t *const n, const uint8_t *const buf, const size_t len, const uint32_t now_ms, bool *const reboot_out) {
     if (len < IOTDATA_MIN_PACKET_SIZE)
         return false;
 
@@ -656,10 +751,16 @@ static inline bool iotdata_node_on_frame(iotdata_node_t *const n, const uint8_t 
             iotdata_node_process_config(n, t->raw, t->length, reboot_out);
             acted = true;
         } else if (t->format == IOTDATA_TLV_FMT_RAW && t->type == IOTDATA_NODE_TLV_CONTROL) {
-            iotdata_node_process_control(n, t->raw, t->length, reboot_out);
+            iotdata_node_process_control(n, t->raw, t->length, now_ms, reboot_out);
             acted = true;
         } else if (t->format == IOTDATA_TLV_FMT_RAW && t->type == IOTDATA_NODE_TLV_SETTINGS) {
             iotdata_node_process_settings(n, t->raw, t->length, reboot_out);
+            acted = true;
+        } else if (t->format == IOTDATA_TLV_FMT_RAW && t->type == IOTDATA_NODE_TLV_CONTENT && n->cfg->content != NULL) {
+            /* NOT COUNTED AS A COMMAND, because nothing was asked of this node: it has been TOLD
+               what some content IS, and whether it ever wants the bytes is its own decision, taken
+               later and on its own power budget. */
+            n->cfg->content(t->raw, t->length, now_ms);
             acted = true;
         } else
             n->stat_unknown++;

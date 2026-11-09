@@ -56,15 +56,44 @@
 /* What a command does with the request's arguments. The kind is a property of the COMMAND, not of
    the medium, which is what lets one table serve all of them. */
 typedef enum {
-    IOTDATA_NODE_CONTROL_ARG_NONE,           /* a flag: the key present, no value */
-    IOTDATA_NODE_CONTROL_ARG_FIXED,          /* a u8 the command itself fixes (enable = 1, disable = 0) */
-    IOTDATA_NODE_CONTROL_ARG_SCOPE_STATUS,   /* a u8 from "scope", read as STATUS_SCOPE_* (which groups) */
-    IOTDATA_NODE_CONTROL_ARG_SCOPE_FILTER,   /* a u8 from "scope", read as FILTER_SCOPE_* (which entries) */
-    IOTDATA_NODE_CONTROL_ARG_STATION,        /* { u16 station, u8 action } -- the action fixed by the command */
-    IOTDATA_NODE_CONTROL_ARG_STATION_ACTION, /* { u16 station, u8 action } -- the action named in the request */
-    IOTDATA_NODE_CONTROL_ARG_REPORTS,        /* not one key: every report that can be asked for */
-    IOTDATA_NODE_CONTROL_ARG_CONTENT,        /* u24 content id -- §4's width, which is not a station's */
+    IOTDATA_NODE_CONTROL_ARG_NONE,             /* a flag: the key present, no value */
+    IOTDATA_NODE_CONTROL_ARG_FIXED,            /* a u8 the command itself fixes (enable = 1, disable = 0) */
+    IOTDATA_NODE_CONTROL_ARG_SCOPE_STATUS,     /* a u8 from "scope", read as STATUS_SCOPE_* (which groups) */
+    IOTDATA_NODE_CONTROL_ARG_SCOPE_FILTER,     /* a u8 from "scope", read as FILTER_SCOPE_* (which entries) */
+    IOTDATA_NODE_CONTROL_ARG_STATION,          /* { u16 station, u8 action } -- the action fixed by the command */
+    IOTDATA_NODE_CONTROL_ARG_STATION_ACTION,   /* { u16 station, u8 action } -- the action named in the request */
+    IOTDATA_NODE_CONTROL_ARG_REPORTS,          /* not one key: every report that can be asked for */
+    IOTDATA_NODE_CONTROL_ARG_CONTENT,          /* u24 content id -- §4's width, which is not a station's */
+    IOTDATA_NODE_CONTROL_ARG_CONTENT_AUDIENCE, /* { u24 content id, u16 station } -- who an offer is for */
+    IOTDATA_NODE_CONTROL_ARG_MANIFEST,         /* a whole offer: see the note by ARG_MANIFEST below */
 } iotdata_node_control_arg_t;
+
+/* How long a name a MANIFEST command may carry. It is NOT the row's bound: a node truncates to
+   whatever its own IOTDATA_NODE_CONTENT_NAME_MAX is, which this header cannot see because it is
+   read before the content module. Wider than the 32 bytes §3 recommends, so that typing a longer
+   one is the node's decision to shorten rather than this layer's to refuse. */
+#ifndef IOTDATA_NODE_CONTROL_CONTENT_NAME_MAX
+#define IOTDATA_NODE_CONTROL_CONTENT_NAME_MAX 48
+#endif
+
+/*
+ * THE WIDEST kvr iotdata_node_control_build() CAN PRODUCE, so a medium sizes its buffer from the
+ * vocabulary instead of counting the current widest command by hand.
+ *
+ * HAND-COUNTED BOUNDS HERE HAVE NOW GONE STALE TWICE. At UPDATE_ENTRY_SIZE+2 every
+ * `* update <station> <action>` typed at a device console overflowed by two and answered "cannot
+ * build"; the fix was +4 and a comment explaining the arithmetic. Then MANIFEST arrived -- nine
+ * fixed bytes and a name -- and overflowed the same buffer by twenty, so `content manifest` worked
+ * over MQTT and said "cannot build" at a console. The gateway's own buffer was a flat 32 and was
+ * one character of name away from the same failure. Every time, the number lived in an application
+ * and a change to THIS table quietly outgrew it.
+ *
+ * Two shapes compete for the maximum: ONE PAIR carrying the widest argument, which is a manifest;
+ * and REPORTS, which is not one pair but one per reportable type.
+ */
+#define _IOTDATA_NODE_CONTROL_PAIR_MAX          (2u + 2u + 9u + IOTDATA_NODE_CONTROL_CONTENT_NAME_MAX + 1u) /* key, vlen, subject, action, the fixed fields, the name, its NUL */
+#define _IOTDATA_NODE_CONTROL_REPORTS_MAX       (3u * IOTDATA_NODE_TLV_SYSTEM_COUNT)                        /* key, vlen, subject -- once per reportable type */
+#define IOTDATA_NODE_CONTROL_BUILD_MAX          ((_IOTDATA_NODE_CONTROL_PAIR_MAX > _IOTDATA_NODE_CONTROL_REPORTS_MAX) ? _IOTDATA_NODE_CONTROL_PAIR_MAX : _IOTDATA_NODE_CONTROL_REPORTS_MAX)
 
 #define IOTDATA_NODE_CONTROL_SCOPE_FROM_REQUEST 0xFF
 
@@ -107,6 +136,18 @@ typedef struct {
     uint8_t scope_filter;  /* FILTER_SCOPE_*; ALL when unsaid */
     uint8_t action;        /* FILTERS_BLOCK / _ALLOW / _NONE */
     uint32_t content;      /* a content id: 24 bits, 0 when unsaid (and 0x000xxx is unaddressable) */
+    /* A MANIFEST's fields, and they are exactly the ones the bytes cannot say: a node authoring an
+       entry reads the size and the gross hash out of its own store, so there is nothing here that
+       could be mistyped into a wrong offer. INDEFINITE is the default expiry rather than zero
+       because zero is §3's revocation sentinel -- an omitted expiry must not withdraw the thing it
+       was meant to offer -- and because an offer standing until it is replaced is the common case. */
+    uint8_t content_encoding;  /* content-type:4 | compression:4 */
+    uint16_t content_expiry_m; /* minutes from receipt; INDEFINITE when unsaid */
+    /* u24, the block-hash stream. NO DEFAULT WORTH THE NAME: every layer below takes any value,
+       and the two places a person states an offer -- this header's argv parser and the control
+       tool -- refuse to build the command without one. See ARG_MANIFEST's parser. */
+    uint32_t content_sig;
+    char content_name[IOTDATA_NODE_CONTROL_CONTENT_NAME_MAX + 1];
 } iotdata_node_control_args_t;
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -220,6 +261,10 @@ static const iotdata_node_control_command_t iotdata_node_control_commands[] = {
     { "content-validate", _CMD(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_VALIDATE), IOTDATA_NODE_CONTROL_ARG_CONTENT, 0 },
     { "content-ota", _CMD(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_OTA_STATUS), IOTDATA_NODE_CONTROL_ARG_NONE, 0 },
     { "content-ota-apply", _CMD(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_OTA_APPLY), IOTDATA_NODE_CONTROL_ARG_CONTENT, 0 },
+    { "content-manifest", _CMD(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_MANIFEST_SET), IOTDATA_NODE_CONTROL_ARG_MANIFEST, 0 },
+    { "content-manifests", _CMD(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_MANIFEST_LIST), IOTDATA_NODE_CONTROL_ARG_NONE, 0 },
+    { "content-advertise", _CMD(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_ADVERTISE), IOTDATA_NODE_CONTROL_ARG_CONTENT_AUDIENCE, 0 },
+    { "content-revoke", _CMD(IOTDATA_NODE_TLV_CONTENT, IOTDATA_NODE_ACTION_CONTENT_REVOKE), IOTDATA_NODE_CONTROL_ARG_CONTENT, 0 },
     /* --- mesh management --------------------------------------------------------------------- */
     { "mesh-peers-update", _CMD(IOTDATA_NODE_SUBJECT_MESH, IOTDATA_NODE_ACTION_MESH_PEERS_UPDATE), IOTDATA_NODE_CONTROL_ARG_STATION_ACTION, 0 },
     { "mesh-peers-clear", _CMD(IOTDATA_NODE_SUBJECT_MESH, IOTDATA_NODE_ACTION_MESH_PEERS_CLEAR), IOTDATA_NODE_CONTROL_ARG_NONE, 0 },
@@ -316,6 +361,38 @@ static inline bool iotdata_node_control_build(iotdata_kvr_t *const kv, const iot
         v[n++] = (uint8_t)(a->content >> 8);
         v[n++] = (uint8_t)a->content;
         break;
+    case IOTDATA_NODE_CONTROL_ARG_CONTENT_AUDIENCE:
+        v[n++] = (uint8_t)(a->content >> 16);
+        v[n++] = (uint8_t)(a->content >> 8);
+        v[n++] = (uint8_t)a->content;
+        /* WHO THE OFFER IS FOR, which is not who the COMMAND is for: `target` drives the node that
+           will advertise, and this is the audience it will advertise TO. Station 0 is not a
+           station, so an unsaid audience means everybody -- and the substitution is made here
+           rather than in each medium, so a console and a JSON request cannot disagree about what
+           saying nothing means. */
+        {
+            const uint16_t audience = (a->station == 0u) ? (uint16_t)IOTDATA_STATION_BROADCAST : a->station;
+            v[n++] = (uint8_t)(audience >> 8);
+            v[n++] = (uint8_t)audience;
+        }
+        break;
+    case IOTDATA_NODE_CONTROL_ARG_MANIFEST: {
+        v[n++] = (uint8_t)(a->content >> 16);
+        v[n++] = (uint8_t)(a->content >> 8);
+        v[n++] = (uint8_t)a->content;
+        v[n++] = a->content_encoding;
+        v[n++] = (uint8_t)(a->content_expiry_m >> 8);
+        v[n++] = (uint8_t)a->content_expiry_m;
+        v[n++] = (uint8_t)(a->content_sig >> 16);
+        v[n++] = (uint8_t)(a->content_sig >> 8);
+        v[n++] = (uint8_t)a->content_sig;
+        /* NUL-TERMINATED, as it is in the MANIFEST TLV itself (§3) and for the same reason: there
+           is then no length field to disagree with the value's own, and a lone NUL is no name. */
+        for (const char *p3 = a->content_name; *p3 != '\0' && (size_t)n + 1u < sizeof(v); p3++)
+            v[n++] = (uint8_t)*p3;
+        v[n++] = 0u;
+        break;
+    }
     case IOTDATA_NODE_CONTROL_ARG_REPORTS:
         /* every report that can be asked for, which is now every system type: a node with nothing
            to say for one answers it empty, and empty is an answer */
@@ -407,8 +484,37 @@ static inline uint8_t iotdata_node_control_action(const char *const s) {
     return IOTDATA_NODE_CONTROL_NODE_FILTERS_NONE; /* "none", "remove", absent: no entry */
 }
 
+/* strtoul: every medium here parses a station id or a content id, JSON or not. It sits above the
+   first of them rather than beside one, because both halves need it now. */
+#include <stdlib.h>
+
+/*
+ * A STATION HAS TO BE THE WHOLE WORD, which this used to not check: it asked whether the first
+ * character was a digit, and strtol stops at the first thing it does not like. So `57d` -- which is
+ * exactly how every log line (`%03PRIX16`) and every MQTT topic in this system spells station
+ * 0x57D -- parsed as decimal 57, and the command went to a different node without a word of
+ * complaint. Typing back what you just read is the natural thing to do, and it silently addressed
+ * somebody else.
+ *
+ * DECIMAL STAYS THE DEFAULT, because changing that would silently redirect every existing script;
+ * what is refused now is a word that is neither wholly decimal nor 0x-prefixed hex. The mistake
+ * names itself instead of being delivered. A content id is the other way round -- hex by default,
+ * see _iotdata_node_control_is_content -- because ids are only ever legible that way.
+ */
 static inline bool _iotdata_node_control_is_station(const char *const s) {
-    return s != NULL && s[0] >= '0' && s[0] <= '9';
+    if (s == NULL || s[0] == '\0')
+        return false;
+    char *end = NULL;
+    const unsigned long v = strtoul(s, &end, (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) ? 16 : 10);
+    return end != NULL && *end == '\0' && v <= (unsigned long)IOTDATA_STATION_MAX;
+}
+
+/* ONE PARSE FOR THE PREDICATE AND THE VALUE, as a content id already has. The call sites used
+   strtol with base 0, which also reads a leading zero as OCTAL -- `057` was station 47. */
+static inline uint16_t iotdata_node_control_station(const char *const s) {
+    if (s == NULL)
+        return 0u;
+    return (uint16_t)(strtoul(s, NULL, (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) ? 16 : 10) & 0x0FFFu);
 }
 static inline bool _iotdata_node_control_is_action(const char *const s) {
     return s != NULL && (strcmp(s, "none") == 0 || strcmp(s, "remove") == 0 || strcmp(s, "block") == 0 || strcmp(s, "allow") == 0);
@@ -433,8 +539,6 @@ static inline bool _iotdata_node_control_is_scope_status(const char *const s) {
 // is looser than JSON's named members, which is the nature of a console; what matters is that both
 // end at the same iotdata_node_control_args_t and the same iotdata_node_control_build.
 // -----------------------------------------------------------------------------------------------------------------------------------------
-
-#include <stdlib.h> /* strtol: both media parse a station id, JSON or not */
 
 /* A content id is typed in hex far more often than in decimal -- §4's allocation is
    (station << 12) | counter, which is only legible as hex -- so a bare `1a2b3c` is read as hex and
@@ -484,6 +588,62 @@ static inline bool _iotdata_node_control_argv_args(const iotdata_node_control_co
             return false;
         args->content = iotdata_node_control_content(argv[first]);
         return true;
+    case IOTDATA_NODE_CONTROL_ARG_CONTENT_AUDIENCE:
+        if (n < 1 || n > 2 || !_iotdata_node_control_is_content(argv[first]))
+            return false;
+        args->content = iotdata_node_control_content(argv[first]);
+        if (n == 2) {
+            if (!_iotdata_node_control_is_station(argv[first + 1]))
+                return false;
+            args->station = iotdata_node_control_station(argv[first + 1]);
+        }
+        return true; /* no audience typed leaves station 0, which the pack reads as everybody */
+    case IOTDATA_NODE_CONTROL_ARG_MANIFEST:
+        /* POSITIONAL: <id> <sig-id|self> [name] [expiry] [encoding].
+         *
+         * THE SIGNATURE IS REQUIRED HERE AND NOWHERE BELOW, which is the whole shape of §3's
+         * "mandatory to provide, optional to use". The codec takes any value and the offers table
+         * keeps any value -- forgiving, because a manifest arriving off the air may legitimately
+         * carry 0 (it IS a signature stream), and refusing one would make this implementation the
+         * arbiter of somebody else's. What is NOT forgiving is the place a PERSON states an offer:
+         * there, forgetting the stream has to be impossible, so the field has no default and the
+         * command does not parse without it.
+         *
+         * `self` IS HOW YOU SAY ZERO ON PURPOSE -- a signature stream's own manifest names no
+         * stream, since hashing the hashes would recurse without end. So the field cannot be
+         * omitted, and one of the things it may say is "none, because I am one": a deliberate
+         * statement rather than an omission, which is exactly the distinction the requirement
+         * exists to force. */
+        if (n < 2 || n > 5 || !_iotdata_node_control_is_content(argv[first]))
+            return false;
+        args->content = iotdata_node_control_content(argv[first]);
+        if (strcmp(argv[first + 1], "self") == 0 || strcmp(argv[first + 1], "none") == 0)
+            args->content_sig = (uint32_t)IOTDATA_CONTENT_SIG_NONE;
+        else if (!_iotdata_node_control_is_content(argv[first + 1]))
+            return false;
+        else
+            args->content_sig = iotdata_node_control_content(argv[first + 1]);
+        if (n >= 3)
+            (void)snprintf(args->content_name, sizeof(args->content_name), "%s", argv[first + 2]);
+        if (n >= 4) {
+            if (strcmp(argv[first + 3], "indefinite") == 0)
+                args->content_expiry_m = (uint16_t)IOTDATA_CONTENT_EXPIRY_INDEFINITE;
+            else {
+                char *end = NULL;
+                const unsigned long m = strtoul(argv[first + 3], &end, 10);
+                if (end == argv[first + 3] || end == NULL || *end != '\0' || m > 0xFFFFuL)
+                    return false;
+                args->content_expiry_m = (uint16_t)m;
+            }
+        }
+        if (n >= 5) {
+            char *end = NULL;
+            const unsigned long e = strtoul(argv[first + 4], &end, 16); /* two nibbles, so hex */
+            if (end == argv[first + 4] || end == NULL || *end != '\0' || e > 0xFFuL)
+                return false;
+            args->content_encoding = (uint8_t)e;
+        }
+        return true;
     case IOTDATA_NODE_CONTROL_ARG_STATION:
     case IOTDATA_NODE_CONTROL_ARG_STATION_ACTION: {
         /* the action is optional and defaults to none, as it does in JSON, so that a station typed
@@ -491,7 +651,7 @@ static inline bool _iotdata_node_control_argv_args(const iotdata_node_control_co
         const int most = (c->arg == IOTDATA_NODE_CONTROL_ARG_STATION_ACTION) ? 2 : 1;
         if (n < 1 || n > most || !_iotdata_node_control_is_station(argv[first]))
             return false;
-        args->station = (uint16_t)(strtol(argv[first], NULL, 0) & 0x0FFF);
+        args->station = iotdata_node_control_station(argv[first]);
         if (n == 2) {
             if (!_iotdata_node_control_is_action(argv[first + 1]))
                 return false;
@@ -530,6 +690,10 @@ static inline const char *iotdata_node_control_argv_help(const iotdata_node_cont
         return " [node|mesh]";
     case IOTDATA_NODE_CONTROL_ARG_CONTENT:
         return " <id>";
+    case IOTDATA_NODE_CONTROL_ARG_CONTENT_AUDIENCE:
+        return " <id> [station]";
+    case IOTDATA_NODE_CONTROL_ARG_MANIFEST:
+        return " <id> <sig-id|self> [name] [minutes|indefinite] [encoding-hex]";
     default:
         return "";
     }
@@ -542,6 +706,8 @@ static inline const iotdata_node_control_command_t *iotdata_node_control_from_ar
     args->target = args->targets[0] = IOTDATA_STATION_BROADCAST;
     args->targets_count = 1;
     args->scope_filter = IOTDATA_NODE_CONTROL_NODE_FILTERS_SCOPE_ALL;
+    /* An unsaid expiry OFFERS indefinitely rather than revoking, which zero would do. */
+    args->content_expiry_m = (uint16_t)IOTDATA_CONTENT_EXPIRY_INDEFINITE;
 
     for (int words = argc; words >= 1; words--) {
         char name[IOTDATA_NODE_CONTROL_ARGV_NAME_MAX];
@@ -638,6 +804,15 @@ static inline uint8_t _iotdata_node_control_json_targets(const cJSON *const j, u
 static inline const iotdata_node_control_command_t *iotdata_node_control_from_json(const cJSON *const root, iotdata_node_control_args_t *const args) {
     if (root == NULL || args == NULL)
         return NULL;
+    /* ZEROED AND DEFAULTED FIRST, exactly as iotdata_node_control_from_argv does it. This used to
+       be total by ENUMERATION -- every field was assigned unconditionally, so the caller's struct
+       never showed through -- and that held right up until a field arrived that is only set when
+       the request mentions it. Then an omitted `name` left whatever the caller's stack held, and
+       the two media built different bytes from the same command. Zeroing makes the property
+       structural instead of a thing to remember with every field added. */
+    *args = (iotdata_node_control_args_t){ 0 };
+    args->scope_filter = IOTDATA_NODE_CONTROL_NODE_FILTERS_SCOPE_ALL;
+    args->content_expiry_m = (uint16_t)IOTDATA_CONTENT_EXPIRY_INDEFINITE;
     /* absent target means BROADCAST -- "this command, to whoever hears it" -- while an absent
        station means none, because a mesh command with no subject has nothing to act on */
     args->targets_count = _iotdata_node_control_json_targets(cJSON_GetObjectItem(root, "target"), args->targets, IOTDATA_NODE_CONTROL_TARGETS_MAX, &args->targets_overflow);
@@ -655,6 +830,28 @@ static inline const iotdata_node_control_command_t *iotdata_node_control_from_js
         args->content = iotdata_node_control_content(jcontent->valuestring);
     else if (cJSON_IsNumber(jcontent) && jcontent->valuedouble >= 0.0 && jcontent->valuedouble <= 16777215.0)
         args->content = (uint32_t)jcontent->valuedouble;
+    /* A MANIFEST's fields BY NAME, which is the medium that wants them that way -- a console types
+       them positionally because four optional words in a row is still readable, and a request
+       written by a program should not have to count commas. Each keeps the console's default when
+       absent, so the two media describe the same offer. */
+    const char *const jname = _iotdata_node_control_json_str(root, "name");
+    if (jname != NULL)
+        (void)snprintf(args->content_name, sizeof(args->content_name), "%s", jname);
+    const cJSON *const jexp = cJSON_GetObjectItem(root, "expiry");
+    if (cJSON_IsString(jexp) && jexp->valuestring != NULL && strcmp(jexp->valuestring, "indefinite") != 0)
+        args->content_expiry_m = (uint16_t)strtoul(jexp->valuestring, NULL, 10);
+    else if (cJSON_IsNumber(jexp) && jexp->valuedouble >= 0.0 && jexp->valuedouble <= 65535.0)
+        args->content_expiry_m = (uint16_t)jexp->valuedouble;
+    const cJSON *const jenc = cJSON_GetObjectItem(root, "encoding");
+    if (cJSON_IsString(jenc) && jenc->valuestring != NULL)
+        args->content_encoding = (uint8_t)strtoul(jenc->valuestring, NULL, 16);
+    else if (cJSON_IsNumber(jenc) && jenc->valuedouble >= 0.0 && jenc->valuedouble <= 255.0)
+        args->content_encoding = (uint8_t)jenc->valuedouble;
+    const cJSON *const jsig = cJSON_GetObjectItem(root, "sig");
+    if (cJSON_IsString(jsig) && jsig->valuestring != NULL)
+        args->content_sig = iotdata_node_control_content(jsig->valuestring);
+    else if (cJSON_IsNumber(jsig) && jsig->valuedouble >= 0.0 && jsig->valuedouble <= 16777215.0)
+        args->content_sig = (uint32_t)jsig->valuedouble;
     return iotdata_node_control_find(_iotdata_node_control_json_str(root, "cmd"));
 }
 

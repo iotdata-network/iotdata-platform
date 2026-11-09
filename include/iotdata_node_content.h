@@ -217,7 +217,8 @@ typedef enum {
     IOTDATA_NODE_CONTENT_ERR_FULL,     /* no room in the ownership table                      */
     /* APPENDED, and that is the rule for this enum: a value reaches a log and will reach a record,
        so a new one goes on the END rather than in the middle where it renumbers the rest. */
-    IOTDATA_NODE_CONTENT_ERR_ABSENT, /* a well-formed id that nothing is stored under       */
+    IOTDATA_NODE_CONTENT_ERR_ABSENT,  /* a well-formed id that nothing is stored under       */
+    IOTDATA_NODE_CONTENT_ERR_STATION, /* §4: a well-formed id belonging to another station    */
 } iotdata_node_content_status_t;
 
 static inline const char *iotdata_node_content_status_name(const iotdata_node_content_status_t s) {
@@ -242,6 +243,8 @@ static inline const char *iotdata_node_content_status_name(const iotdata_node_co
         return "no room to own another";
     case IOTDATA_NODE_CONTENT_ERR_ABSENT:
         return "no such content id";
+    case IOTDATA_NODE_CONTENT_ERR_STATION:
+        return "that id belongs to another station";
     default:
         break;
     }
