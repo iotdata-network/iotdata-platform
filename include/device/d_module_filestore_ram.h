@@ -49,6 +49,11 @@ typedef struct {
     uint32_t total; /* what create() was told to expect */
     uint8_t data[FILESTORE_RAM_BYTES];
     uint8_t map[FILESTORE_RAM_MAP_BYTES]; /* one bit per byte: written, or not yet */
+    /* The sidecar, in the slot rather than beside it -- there is no directory here. It lives with
+       the content for the same reason it does on the other two stores: destroying the slot takes
+       it, so a description cannot outlive the bytes it describes. */
+    uint8_t meta[D_FILESTORE_META_MAX];
+    uint8_t meta_len;
 } filestore_ram_slot_t;
 
 typedef struct {
@@ -57,7 +62,7 @@ typedef struct {
     /* one-shot refusals, so the module's store-failure paths are reachable from a test */
     bool fail_create, fail_write, fail_rename;
     /* what was asked of it, for a test to assert on rather than infer from side effects */
-    uint32_t stat_create, stat_write, stat_read, stat_destroy, stat_rename, stat_complete;
+    uint32_t stat_create, stat_write, stat_read, stat_destroy, stat_rename, stat_complete, stat_meta_write, stat_meta_read;
     uint32_t capacity; /* what space() reports; 0 means "as much as a free slot holds" */
 } filestore_ram_t;
 
@@ -152,6 +157,35 @@ static inline void _filestore_ram_destroy(void *const ctx, const uint32_t id) {
     filestore_ram_slot_t *const s = _filestore_ram_find(fs, id);
     if (s != NULL)
         *s = (filestore_ram_slot_t){ 0 };
+}
+
+// ------------------------------------------------------------------------------------------------------------------------
+
+/* `len` 0 removes it, which is how a description is withdrawn without touching the bytes. */
+static inline int _filestore_ram_meta_write(void *const ctx, const uint32_t id, const void *const buf, const size_t len) {
+    filestore_ram_t *const fs = (filestore_ram_t *)ctx;
+    filestore_ram_slot_t *const s = _filestore_ram_find(fs, id);
+    if (s == NULL || len > sizeof(s->meta))
+        return -1;
+    if (len > 0u && buf == NULL)
+        return -1;
+    if (len > 0u)
+        memcpy(s->meta, buf, len);
+    s->meta_len = (uint8_t)len;
+    fs->stat_meta_write++;
+    return (int)len;
+}
+
+/* The bytes, or 0 when there is no sidecar -- which is not an error: most content has none. */
+static inline int _filestore_ram_meta_read(void *const ctx, const uint32_t id, void *const buf, const size_t len) {
+    filestore_ram_t *const fs = (filestore_ram_t *)ctx;
+    const filestore_ram_slot_t *const s = _filestore_ram_find(fs, id);
+    fs->stat_meta_read++;
+    if (s == NULL || buf == NULL)
+        return (s == NULL) ? 0 : -1;
+    const size_t n = (s->meta_len < len) ? (size_t)s->meta_len : len;
+    memcpy(buf, s->meta, n);
+    return (int)n;
 }
 
 // ------------------------------------------------------------------------------------------------------------------------
@@ -259,6 +293,8 @@ static inline const d_filestore_t *filestore_ram_init(filestore_ram_t *const fs)
         .space = _filestore_ram_space,
         .have = _filestore_ram_have,
         .complete = _filestore_ram_complete,
+        .meta_write = _filestore_ram_meta_write,
+        .meta_read = _filestore_ram_meta_read,
     };
     return &fs->backend;
 }

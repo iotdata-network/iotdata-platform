@@ -40,7 +40,8 @@
 #endif
 
 #define FILESTORE_LINUX_NAME_LEN     6 /* six hex digits: §4's 24-bit id, exactly */
-#define FILESTORE_LINUX_FULL_MAX     (FILESTORE_LINUX_PATH_MAX + FILESTORE_LINUX_NAME_LEN + 2)
+
+#define FILESTORE_LINUX_FULL_MAX     (FILESTORE_LINUX_PATH_MAX + FILESTORE_LINUX_NAME_LEN + 6)
 
 /* The two filesystems that accept a write and lose it on reboot. Spelled out rather than taken from
    <linux/magic.h>, which is not present on every toolchain this builds under -- the same choice
@@ -80,6 +81,10 @@ typedef struct {
 
 static inline bool _filestore_linux_path(const filestore_linux_t *const fs, const uint32_t id, char *const out, const size_t size) {
     return snprintf(out, size, "%s/%06lx", fs->dir, (unsigned long)(id & 0xFFFFFFu)) < (int)size;
+}
+
+static inline bool _filestore_linux_meta_path(const filestore_linux_t *const fs, const uint32_t id, char *const out, const size_t size) {
+    return snprintf(out, size, "%s/%06lx.m", fs->dir, (unsigned long)(id & 0xFFFFFFu)) < (int)size;
 }
 
 // ------------------------------------------------------------------------------------------------------------------------
@@ -169,6 +174,8 @@ static inline bool _filestore_linux_create(void *const ctx, const uint32_t id, c
     _filestore_linux_wr_close(fs); /* one insert at a time, so an older writer is finished with */
     char path[FILESTORE_LINUX_FULL_MAX];
     /* "wb" truncates, which is the create-over-an-existing-id case and needs no separate unlink. */
+    if (_filestore_linux_meta_path(fs, id, path, sizeof(path)))
+        (void)unlink(path);
     if (!_filestore_linux_path(fs, id, path, sizeof(path)) || (fs->wr = fopen(path, "wb")) == NULL) {
         fs->stat_create_fail++;
         return false;
@@ -244,10 +251,52 @@ static inline void _filestore_linux_destroy(void *const ctx, const uint32_t id) 
     _filestore_linux_release(fs, id);
     _filestore_linux_walk_close(fs); /* a walk holding this entry is no longer a walk of what is here */
     char path[FILESTORE_LINUX_FULL_MAX];
+    if (_filestore_linux_meta_path(fs, id, path, sizeof(path)))
+        (void)unlink(path);
     if (_filestore_linux_path(fs, id, path, sizeof(path)) && unlink(path) == 0) {
         fs->stat_destroy++;
         _filestore_linux_dr_sync(fs); /* gone, and stays gone */
     }
+}
+
+static inline int _filestore_linux_meta_write(void *const ctx, const uint32_t id, const void *const buf, const size_t len) {
+    filestore_linux_t *const fs = (filestore_linux_t *)ctx;
+    if (fs == NULL || !fs->open || len > (size_t)D_FILESTORE_META_MAX)
+        return -1;
+    char path[FILESTORE_LINUX_FULL_MAX], tmp[FILESTORE_LINUX_FULL_MAX];
+    if (!_filestore_linux_meta_path(fs, id, path, sizeof(path)) || snprintf(tmp, sizeof(tmp), "%s.t", path) >= (int)sizeof(tmp))
+        return -1;
+    if (len == 0u) {
+        (void)unlink(path);
+        return 0;
+    }
+    FILE *const f = fopen(tmp, "wb");
+    if (f == NULL)
+        return -1;
+    const size_t n = fwrite(buf, 1u, len, f);
+    const bool ok = (n == len) && (fflush(f) == 0);
+    (void)fclose(f);
+    if (!ok || rename(tmp, path) != 0) {
+        (void)unlink(tmp);
+        return -1;
+    }
+    return (int)len;
+}
+
+/* The bytes, or 0 when there is no sidecar -- which is not an error: most content has none. */
+static inline int _filestore_linux_meta_read(void *const ctx, const uint32_t id, void *const buf, const size_t len) {
+    filestore_linux_t *const fs = (filestore_linux_t *)ctx;
+    if (fs == NULL || !fs->open || buf == NULL)
+        return -1;
+    char path[FILESTORE_LINUX_FULL_MAX];
+    if (!_filestore_linux_meta_path(fs, id, path, sizeof(path)))
+        return -1;
+    FILE *const f = fopen(path, "rb");
+    if (f == NULL)
+        return 0;
+    const size_t n = fread(buf, 1u, len, f);
+    (void)fclose(f);
+    return (int)n;
 }
 
 // ------------------------------------------------------------------------------------------------------------------------
@@ -449,6 +498,8 @@ static inline const d_filestore_t *filestore_linux_open(filestore_linux_t *const
         .iterate = _filestore_linux_iterate,
         .stat = _filestore_linux_stat,
         .space = _filestore_linux_space,
+        .meta_write = _filestore_linux_meta_write,
+        .meta_read = _filestore_linux_meta_read,
         .have = _filestore_linux_have,
         .complete = _filestore_linux_complete,
     };

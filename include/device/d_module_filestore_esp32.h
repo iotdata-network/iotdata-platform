@@ -81,7 +81,8 @@
 #endif
 
 #define FILESTORE_ESP32_NAME_LEN 6 /* six hex digits: §4's 24-bit id, exactly */
-#define FILESTORE_ESP32_PATH_MAX (sizeof(FILESTORE_ESP32_BASE) + FILESTORE_ESP32_NAME_LEN + 2)
+
+#define FILESTORE_ESP32_PATH_MAX (sizeof(FILESTORE_ESP32_BASE) + FILESTORE_ESP32_NAME_LEN + 6)
 
 // ------------------------------------------------------------------------------------------------------------------------
 // ------------------------------------------------------------------------------------------------------------------------
@@ -111,6 +112,10 @@ typedef struct {
 
 static inline char *_filestore_esp32_path(const uint32_t id, char *const out, const size_t size) {
     return snprintf_inline(out, size, FILESTORE_ESP32_BASE "/%06lx", (unsigned long)(id & 0xFFFFFFu));
+}
+
+static inline char *_filestore_esp32_meta_path(const uint32_t id, char *const out, const size_t size) {
+    return snprintf_inline(out, size, FILESTORE_ESP32_BASE "/%06lx.m", (unsigned long)(id & 0xFFFFFFu));
 }
 
 // ------------------------------------------------------------------------------------------------------------------------
@@ -189,6 +194,7 @@ static inline bool _filestore_esp32_create(void *const ctx, const uint32_t id, c
     _filestore_esp32_release(fs, id);
     _filestore_esp32_wr_close(fs); /* only one insert at a time, so an older writer is finished with */
     char path[FILESTORE_ESP32_PATH_MAX];
+    (void)unlink(_filestore_esp32_meta_path(id, path, sizeof(path)));
     /* "wb" truncates, which is the create-over-an-existing-id case and wants no separate unlink. */
     if ((fs->wr = fopen(_filestore_esp32_path(id, path, sizeof(path)), "wb")) == NULL) {
         ESP_LOGE(__tag_device_filestore, "create: fopen(%s): %s", path, strerror(errno));
@@ -269,8 +275,49 @@ static inline void _filestore_esp32_destroy(void *const ctx, const uint32_t id) 
     _filestore_esp32_release(fs, id);
     _filestore_esp32_dr_close(fs); /* a walk holding this entry is no longer a walk of what is here */
     char path[FILESTORE_ESP32_PATH_MAX];
+    (void)unlink(_filestore_esp32_meta_path(id, path, sizeof(path)));
     if (unlink(_filestore_esp32_path(id, path, sizeof(path))) == 0)
         fs->stat_destroy++;
+}
+
+static inline int _filestore_esp32_meta_write(void *const ctx, const uint32_t id, const void *const buf, const size_t len) {
+    filestore_esp32_t *const fs = (filestore_esp32_t *)ctx;
+    if (fs == NULL || !fs->mounted || len > (size_t)D_FILESTORE_META_MAX)
+        return -1;
+    char path[FILESTORE_ESP32_PATH_MAX], tmp[FILESTORE_ESP32_PATH_MAX + 2];
+    (void)_filestore_esp32_meta_path(id, path, sizeof(path));
+    if (snprintf(tmp, sizeof(tmp), "%s.t", path) >= (int)sizeof(tmp))
+        return -1;
+    if (len == 0u) {
+        (void)unlink(path);
+        return 0;
+    }
+    FILE *const f = fopen(tmp, "wb");
+    if (f == NULL)
+        return -1;
+    const size_t n = fwrite(buf, 1u, len, f);
+    const bool ok = (n == len) && (fflush(f) == 0);
+    (void)fclose(f);
+    (void)unlink(path); /* SPIFFS will not rename over an existing name */
+    if (!ok || rename(tmp, path) != 0) {
+        (void)unlink(tmp);
+        return -1;
+    }
+    return (int)len;
+}
+
+/* The bytes, or 0 when there is no sidecar -- which is not an error: most content has none. */
+static inline int _filestore_esp32_meta_read(void *const ctx, const uint32_t id, void *const buf, const size_t len) {
+    filestore_esp32_t *const fs = (filestore_esp32_t *)ctx;
+    if (fs == NULL || !fs->mounted || buf == NULL)
+        return -1;
+    char path[FILESTORE_ESP32_PATH_MAX];
+    FILE *const f = fopen(_filestore_esp32_meta_path(id, path, sizeof(path)), "rb");
+    if (f == NULL)
+        return 0;
+    const size_t n = fread(buf, 1u, len, f);
+    (void)fclose(f);
+    return (int)n;
 }
 
 // ------------------------------------------------------------------------------------------------------------------------
@@ -434,6 +481,8 @@ static inline const d_filestore_t *filestore_esp32_mount(filestore_esp32_t *cons
         .iterate = _filestore_esp32_iterate,
         .stat = _filestore_esp32_stat,
         .space = _filestore_esp32_space,
+        .meta_write = _filestore_esp32_meta_write,
+        .meta_read = _filestore_esp32_meta_read,
         .have = _filestore_esp32_have,
         .complete = _filestore_esp32_complete,
     };

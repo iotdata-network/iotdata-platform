@@ -62,7 +62,11 @@ typedef struct {
     /* the wire path's, unused so far */
     bool (*have)(void *ctx, uint32_t id, uint16_t chunk);
     bool (*complete)(void *ctx, uint32_t id);
+    int (*meta_write)(void *ctx, uint32_t id, const void *buf, size_t len);
+    int (*meta_read)(void *ctx, uint32_t id, void *buf, size_t len);
 } d_filestore_t;
+
+#define D_FILESTORE_META_MAX 96u
 
 // ------------------------------------------------------------------------------------------------------------------------
 // ------------------------------------------------------------------------------------------------------------------------
