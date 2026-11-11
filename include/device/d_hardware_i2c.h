@@ -195,6 +195,12 @@ void hw_i2c_bus_stop(void) {
 // ------------------------------------------------------------------------------------------------------------------------
 // ------------------------------------------------------------------------------------------------------------------------
 
+static inline bool hw_i2c_bus_active(void) {
+    return s_i2c_bus != NULL;
+}
+
+// ------------------------------------------------------------------------------------------------------------------------
+
 static inline esp_err_t hw_i2c_dev_probe(const uint8_t addr) {
     return i2c_master_probe(s_i2c_bus, addr, I2C_TIMEOUT_MS);
 }
@@ -233,6 +239,12 @@ static inline esp_err_t hw_i2c_dev_reg_read(const i2c_master_dev_handle_t dev, c
 
 static inline esp_err_t hw_i2c_dev_write(const i2c_master_dev_handle_t dev, const uint8_t *const data, const size_t len) {
     return i2c_master_transmit(dev, data, len, I2C_TIMEOUT_MS);
+}
+
+// ------------------------------------------------------------------------------------------------------------------------
+
+static inline esp_err_t hw_i2c_dev_write_read(const i2c_master_dev_handle_t dev, const uint8_t *const wr, const size_t wr_len, uint8_t *const data, const size_t len) {
+    return i2c_master_transmit_receive(dev, wr, wr_len, data, len, I2C_TIMEOUT_MS);
 }
 
 // ------------------------------------------------------------------------------------------------------------------------
